@@ -58,6 +58,7 @@ class ElementObs:
     input_kind: str | None = None
     href_template: str | None = None
     in_form: str | None = None
+    hoverable: bool = False  # likely to reveal a hidden menu on hover (aria-haspopup or a hidden sibling menu)
 
     def props(self) -> dict:
         d = asdict(self)

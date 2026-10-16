@@ -11,6 +11,8 @@ dependencies = [
   "fastapi>=0.115",
   "uvicorn[standard]>=0.30",
   "pyyaml>=6.0",
+  "jsonschema>=4.0",
+  "mcp>=2.3,<3",
   "pillow>=10.4",
   "imageio-ffmpeg>=0.5.1",
 ]
@@ -34,4 +36,5 @@ markers = [
   "integration: needs FalkorDB on localhost:6379 (docker compose up -d)",
   "browser: needs Playwright chromium (playwright install chromium)",
   "slow: records video / runs ffmpeg",
+  "llm: needs a real LLM (LLM_API_KEY or LLM_API_BASE); skipped otherwise",
 ]

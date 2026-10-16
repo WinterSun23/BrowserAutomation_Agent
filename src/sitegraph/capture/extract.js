@@ -82,6 +82,12 @@
     if (el.getAttribute('aria-modal') === 'true') return true;
     try { return el.tagName === 'DIALOG' && el.matches(':modal'); } catch (e) { return false; }
   };
+  const hasHiddenPopup = (el) => {
+    const p = el.parentElement; if (!p) return false;
+    const sub = p.querySelector(':scope > ul, :scope > [role="menu"], :scope > [class*="dropdown"], ' +
+      ':scope > [class*="submenu"], :scope > [class*="sub-menu"]');
+    return !!sub && sub !== el && !visible(sub);
+  };
   const nodes = []; const index = new Map();
   for (const el of (document.body ? document.body.querySelectorAll('*') : [])) {
     const r = role(el); if (!r) continue;
@@ -100,6 +106,7 @@
         checked: el.checked === undefined ? el.getAttribute('aria-checked') : String(el.checked),
         disabled: String(!!el.disabled || el.getAttribute('aria-disabled') === 'true'),
         modal: String(isModal(el)),
+        haspopup: el.getAttribute('aria-haspopup'), popup: String(hasHiddenPopup(el)),
       },
       bbox: [rect.x, rect.y, rect.width, rect.height],
       css: cssPath(el, false), gcss: cssPath(el, true), testid: el.getAttribute('data-testid'),

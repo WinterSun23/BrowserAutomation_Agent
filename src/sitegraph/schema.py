@@ -9,7 +9,8 @@ _DEVICE_FULLTEXT = [("Element", "name_sample"), ("Page", "title")]
 _DEVICE_VECTOR = ["State", "Component", "Element", "Intent", "Workflow", "DemoRequest", "Feature"]
 _DEVICE_UNIQUE = ["State", "Page", "Component", "ComponentState", "Element", "Workflow", "Intent"]
 
-_OPS_EXACT = [("Agent", "id"), ("Task", "id"), ("Claim", "target_gid"), ("Branch", "name"), ("Commit", "id")]
+_OPS_EXACT = [("Agent", "id"), ("Task", "id"), ("Claim", "target_gid"), ("Branch", "name"), ("Commit", "id"),
+              ("WorkItem", "gid"), ("WorkItem", "scope")]
 _PROFILE_EXACT = [("Preference", "key"), ("Memory", "gid"), ("Session", "id"), ("Request", "gid"),
                   ("SiteEntry", "gid"), ("ExplorationPolicy", "name")]
 _PROFILE_VECTOR = ["Memory", "Request"]

@@ -5,13 +5,17 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
+from ..browser.items import choose_item, live_item_texts
 from ..browser.locate import ElementResolver, Located
 from ..capture.model import ElementObs, StateObs
 from ..capture.segment import CLICKABLE_ROLES, absent_cs_gid, build_state
 from ..graph.activity import ActivityLog
 from ..graph.map_writer import MapWriter
-from ..graph.queries import Route, RouteStep, best_routes, entry_state, explain, find_targets, load_element
+from ..graph.queries import (Route, RouteStep, best_routes, entry_state, explain, find_targets, load_element,
+                             next_actions)
+from ..ids import ulid
 from ..normalize import domain_of, var_name
+from ..ops import Ops
 from ..policy import ExplorationPolicy, robots_allowed
 
 
@@ -54,16 +58,31 @@ class ExecResult:
 
 class Navigator:
     def __init__(self, store, key, domain, session, settings, embedder, llm=None, blobs=None, events=None,
-                 agent_id: str = "navigator-1", task_id: str | None = None):
+                 agent_id: str = "navigator-1", task_id: str | None = None, ops: Ops | None = None,
+                 escalate=None):
         self.store, self.key, self.domain, self.session, self.s = store, key, domain, session, settings
         self.embedder, self.llm, self.blobs, self.events = embedder, llm, blobs, events
         self.agent_id, self.task_id = agent_id, task_id
+        self._ops = ops                         # created on first use, so a Navigator can exist without a database
         self.writer = MapWriter(store, key, settings)
         self.activity = ActivityLog(store, key)
         self.resolver = ElementResolver(session, embedder, llm)
+        self._request_text: str | None = None
+        self.escalation = escalate            # NavigatorEscalation or None (see agents/escalation.py)
+        self._escalations = 0
+        self._last_recovery: dict | None = None
+        self._policy: ExplorationPolicy | None = None
+
+    @property
+    def ops(self) -> Ops:
+        if self._ops is None:
+            self._ops = Ops(self.store, self.s.uid, self.domain)
+        return self._ops
 
     # ---------- observation ----------
     def observe(self) -> StateObs:
+        # Always load lazy / infinite content first, so scanning, replaying and executing all see the same page.
+        self.session.load_all(self.s.max_scrolls)
         return build_state(self.session.snapshot(), self.domain, self.s.template_min_items)
 
     def write_state(self, obs: StateObs) -> str:
@@ -87,6 +106,13 @@ class Navigator:
     def _click(self, located: Located) -> None:
         located.locator.click(timeout=5000)
         self.session.settle()
+
+    def _hover(self, located: Located) -> None:
+        located.locator.hover(timeout=5000)
+        self.session.settle()
+
+    def _act(self, kind: str, located: Located) -> None:
+        (self._hover if kind == "hover" else self._click)(located)
 
     # ---------- exploration ----------
     def _candidates(self, obs: StateObs, policy: ExplorationPolicy, report: ExploreReport) -> list[ElementObs]:
@@ -115,13 +141,14 @@ class Navigator:
 
     def _replay(self, url: str, pre: tuple) -> bool:
         self.session.goto(url)
-        for el_gid in pre:
+        for token in pre:  # "<el_gid>" = click it, "hover|<el_gid>" = hover it
+            kind, el_gid = ("hover", token[6:]) if token.startswith("hover|") else ("click", token)
             obs = self.observe()
             el = obs.element(el_gid)
             loc = self.resolver.resolve(el.props()) if el else None
             if loc is None:
                 return False
-            self._click(loc)
+            self._act(kind, loc)
         return True
 
     def _fill_form(self, obs: StateObs, el: ElementObs) -> tuple[list[str], str | None]:
@@ -145,97 +172,134 @@ class Navigator:
                 out.append((g, src, dst, b[g].cs_name if g in b else "absent", a[g].cs_name if g in a else "absent"))
         return out
 
-    def explore(self, entry_url: str, policy: ExplorationPolicy) -> ExploreReport:
+    def _graph_states(self) -> int:
+        return self.store.ro_query(self.key, "MATCH (s:State) RETURN count(s)")[0][0]
+
+    def _add_items(self, scope: str, url: str, depth: int, els, pre: tuple, pre_cstates: tuple) -> None:
+        """Queue a click item for every element, plus a hover item for elements that look like menu triggers
+        (desktop only: touch devices have no hover)."""
+        can_hover = getattr(self.session, "device", "desktop") == "desktop"
+        for e in els:
+            self.ops.add_item(scope, self.key, "click", url, depth, el_gid=e.gid, pre=pre, pre_cstates=pre_cstates)
+            if can_hover and e.hoverable:
+                self.ops.add_item(scope, self.key, "hover", url, depth, el_gid=e.gid, pre=pre,
+                                  pre_cstates=pre_cstates)
+
+    def _process_page(self, scope: str, item: dict, policy: ExplorationPolicy, report: ExploreReport,
+                      entry_url: str) -> None:
+        url = item["url"]
+        if policy.respect_robots and not robots_allowed(url):
+            return
+        self.session.goto(url)
+        base_obs = self.observe()
+        report.pages += 1
+        base = self.write_state(base_obs)
+        report.states.add(base)
+        if item["depth"] == 0 and url == entry_url:
+            self.writer.set_entry(base)
+        self._add_items(scope, url, item["depth"], self._candidates(base_obs, policy, report), (), ())
+
+    def _process_click(self, scope: str, item: dict, policy: ExplorationPolicy, report: ExploreReport, run: str,
+                       step_i: int) -> int:
+        url, depth, pre, pre_cstates = item["url"], item["depth"], item["pre"], item["pre_cstates"]
+        kind = item["kind"]  # 'click' or 'hover'
+        try:
+            if not self._replay(url, pre):
+                return step_i
+            self.ops.renew(item["gid"], self.agent_id, self.s.claim_ttl_ms)
+            before = self.observe()
+            before_gid = self.write_state(before)
+            el = before.element(item["el_gid"])
+            if el is None:
+                if kind == "click":
+                    self.writer.mark_tried(item["el_gid"])
+                return step_i
+            loc = self.resolver.resolve(el.props())
+            if loc is None:
+                if kind == "click":
+                    self.writer.mark_tried(el.gid)
+                return step_i
+            requires, value_var = ([], None)
+            if kind == "click" and el.in_form and policy.allow_forms:
+                requires, value_var = self._fill_form(before, el)
+            t_click = time.monotonic()
+            self._act(kind, loc)
+            after = self.observe()
+        except Exception as exc:  # navigation errors, detached elements, timeouts
+            report.errors += 1
+            if kind == "click":
+                self.writer.mark_tried(item["el_gid"])
+            self.activity.add_step(run, step_i, kind, None, None, None, ok=False, error=str(exc)[:300])
+            return step_i + 1
+        token = el.gid if kind == "click" else "hover|" + el.gid
+        latency = int((time.monotonic() - t_click) * 1000)
+        after_gid = self.writer.resolve_state(after) or after.state_gid
+        edge_gid, dst = None, before_gid
+        if after.url_template != before.url_template or after_gid != before_gid:
+            dst = self.write_state(after)
+            report.states.add(dst)
+            edge_gid = self.writer.write_action(before_gid, dst, el.props(), kind, value_var, pre_cstates, requires)
+            report.actions += 1
+            if after.url_template != before.url_template:
+                if domain_of(after.url) == self.domain and depth + 1 <= policy.max_depth:
+                    self.ops.add_item(scope, self.key, "page", after.url, depth + 1)
+            elif len(pre) < self.s.max_path_len:
+                known = {e.gid for e in before.elements()}
+                fresh = [e for e in self._candidates(after, policy, report) if e.gid not in known]
+                self._add_items(scope, url, depth, fresh, pre + (token,), pre_cstates)
+        else:
+            changes = self._diff_components(before, after)
+            if changes:
+                self.write_state(after)
+                for comp, src, dstc, sname, dname in changes:
+                    edge_gid = self.writer.write_transition(comp, src, dstc, el.props(), kind, sname, dname)
+                    report.transitions += 1
+                    comp_after = after.component(comp)
+                    if comp_after and len(pre) < self.s.max_path_len:
+                        known = {e.gid for e in before.elements()}
+                        fresh = [e for e in comp_after.elements
+                                 if e.gid not in known and e.role in CLICKABLE_ROLES and policy.allows(e)]
+                        self._add_items(scope, url, depth, fresh, pre + (token,), pre_cstates + (dstc,))
+        if kind == "click":
+            self.writer.mark_tried(el.gid)
+        self.activity.add_step(run, step_i, kind, edge_gid, before_gid, dst, ok=True, latency_ms=latency,
+                               value_var=value_var)
+        self._emit({"type": "step", "label": f"{kind} '{el.name_sample[:40]}'", "ok": True}, frame=True)
+        return step_i + 1
+
+    def explore(self, entry_url: str, policy: ExplorationPolicy, scope: str | None = None) -> ExploreReport:
+        """Pull-and-claim exploration. Several Navigators may call this with the same `scope` (and graph) at once:
+        work lives as WorkItems in the ops graph and each item is claimed, so no two agents repeat the same
+        page visit or the same path (element plus the clicks that lead to it)."""
         t0 = time.monotonic()
+        scope = scope or ulid("scope")
         run = self.activity.start_run("explore", self.agent_id, self.task_id, request=f"explore {entry_url}")
         report = ExploreReport(run_gid=run)
-        queue: deque[tuple[str, int]] = deque([(entry_url, 0)])
-        seen_templates: set[str] = set()
-        step_i, first = 0, True
-        while queue and not self._out_of_budget(t0, policy, report):
-            url, depth = queue.popleft()
-            base_obs = None
+        self.ops.register_agent(self.agent_id, "navigator")
+        self.ops.add_item(scope, self.key, "page", entry_url, 0)
+        step_i, idle = 0, 0
+        while not self._out_of_budget(t0, policy, report) and self._graph_states() < policy.max_states:
+            item, others_hold_work = self.ops.next_item(scope, self.agent_id, self.key, self.s.claim_ttl_ms)
+            if item is None:
+                if not others_hold_work:
+                    break
+                idle += 1
+                if idle > self.s.claim_retries:
+                    break
+                time.sleep(self.s.claim_wait_s)
+                continue
+            idle = 0
+            error = None
             try:
-                if policy.respect_robots and not robots_allowed(url):
-                    continue
-                self.session.goto(url)
-                base_obs = self.observe()
-            except Exception:
-                report.errors += 1
-                continue
-            if base_obs.url_template in seen_templates:
-                continue
-            seen_templates.add(base_obs.url_template)
-            report.pages += 1
-            base = self.write_state(base_obs)
-            report.states.add(base)
-            if first:
-                self.writer.set_entry(base)
-                first = False
-            work = deque(_Work(e.gid) for e in self._candidates(base_obs, policy, report))
-            while work and not self._out_of_budget(t0, policy, report):
-                item = work.popleft()
-                try:
-                    if not self._replay(url, item.pre):
-                        continue
-                    before = self.observe()
-                    before_gid = self.write_state(before)
-                    el = before.element(item.el_gid)
-                    if el is None:
-                        self.writer.mark_tried(item.el_gid)
-                        continue
-                    loc = self.resolver.resolve(el.props())
-                    if loc is None:
-                        self.writer.mark_tried(el.gid)
-                        continue
-                    requires, value_var = ([], None)
-                    if el.in_form and policy.allow_forms:
-                        requires, value_var = self._fill_form(before, el)
-                    t_click = time.monotonic()
-                    self._click(loc)
-                    after = self.observe()
-                except Exception as exc:  # navigation errors, detached elements, timeouts
-                    report.errors += 1
-                    self.writer.mark_tried(item.el_gid)
-                    self.activity.add_step(run, step_i, "click", None, None, None, ok=False, error=str(exc)[:300])
-                    step_i += 1
-                    continue
-                latency = int((time.monotonic() - t_click) * 1000)
-                after_gid = self.writer.resolve_state(after) or after.state_gid
-                edge_gid, dst = None, before_gid
-                if after.url_template != before.url_template or after_gid != before_gid:
-                    dst = self.write_state(after)
-                    report.states.add(dst)
-                    edge_gid = self.writer.write_action(before_gid, dst, el.props(), "click", value_var,
-                                                        item.pre_cstates, requires)
-                    report.actions += 1
-                    if after.url_template != before.url_template:
-                        if domain_of(after.url) == self.domain and depth + 1 <= policy.max_depth:
-                            queue.append((after.url, depth + 1))
-                    elif len(item.pre) < 2:
-                        known = {e.gid for e in before.elements()}
-                        for e in self._candidates(after, policy, report):
-                            if e.gid not in known:
-                                work.append(_Work(e.gid, item.pre + (el.gid,), item.pre_cstates))
+                if item["kind"] == "page":
+                    self._process_page(scope, item, policy, report, entry_url)
                 else:
-                    changes = self._diff_components(before, after)
-                    if changes:
-                        self.write_state(after)
-                        for comp, src, dstc, sname, dname in changes:
-                            edge_gid = self.writer.write_transition(comp, src, dstc, el.props(), "click", sname, dname)
-                            report.transitions += 1
-                            comp_after = after.component(comp)
-                            if comp_after and len(item.pre) < 2:
-                                known = {e.gid for e in before.elements()}
-                                for e in comp_after.elements:
-                                    if e.gid not in known and e.role in CLICKABLE_ROLES and policy.allows(e):
-                                        work.append(_Work(e.gid, item.pre + (el.gid,), item.pre_cstates + (dstc,)))
-                self.writer.mark_tried(el.gid)
-                self.activity.add_step(run, step_i, "click", edge_gid, before_gid, dst, ok=True, latency_ms=latency,
-                                       value_var=value_var)
-                step_i += 1
-                self._emit({"type": "step", "label": f"click '{el.name_sample[:40]}'", "ok": True}, frame=True)
-            self.writer.refresh_frontier(base, policy.max_risk_cost)
+                    step_i = self._process_click(scope, item, policy, report, run, step_i)
+            except Exception as exc:
+                report.errors += 1
+                error = str(exc)[:200]
+            finally:
+                self.ops.finish_item(item["gid"], self.agent_id, error)
         for g in report.states:
             self.writer.refresh_frontier(g, policy.max_risk_cost)
         self.activity.finish_run(run, "done")
@@ -266,13 +330,95 @@ class Navigator:
 
     def _enter_cstate(self, cs_gid: str) -> bool:
         rows = self.store.ro_query(self.key, "MATCH (:ComponentState)-[t:TRANSITION]->(:ComponentState {gid:$cs}) "
-                                             "RETURN t.el_gid ORDER BY t.success_count DESC LIMIT 1", {"cs": cs_gid})
+                                             "RETURN t.el_gid, t.action_type ORDER BY t.success_count DESC LIMIT 1",
+                                   {"cs": cs_gid})
         el = load_element(self.store, self.key, rows[0][0]) if rows else None
         loc = self.resolver.resolve(el) if el else None
         if loc is None:
             return False
-        self._click(loc)
+        self._act("hover" if rows[0][1] == "hover" else "click", loc)
         return True
+
+    # ---------- escalation (hand over to an LLM recovery agent when the deterministic path is stuck) ----------
+    def _can_escalate(self) -> bool:
+        return self.escalation is not None and self._escalations < self.s.max_escalations_per_run
+
+    def _recent_steps(self, run_gid: str) -> list[dict]:
+        rows = self.store.ro_query(self.key, "MATCH (st:Step)-[:IN_RUN]->(:Run {gid:$r}) "
+                                             "RETURN st.i, st.action_type, st.ok, st.error ORDER BY st.i DESC LIMIT 5",
+                                   {"r": run_gid})
+        return [{"step": r[0], "action": r[1], "ok": r[2], "error": (r[3] or "")[:120]} for r in reversed(rows)]
+
+    def _state_summary(self, state_gid: str) -> str:
+        rows = self.store.ro_query(self.key, "MATCH (s:State {gid:$g}) RETURN coalesce(s.summary, '')", {"g": state_gid})
+        return rows[0][0] if rows else ""
+
+    def _run_recovery(self, ctx) -> dict:
+        """Run the recovery agent; returns a record of what happened (also stored as an Observation)."""
+        self._escalations += 1
+        self._emit({"type": "escalation", "status": "started", "error": ctx.error[:200]})
+        try:
+            run = self.escalation.recover(ctx, self)
+            record = {"status": run.status, "error": ctx.error[:300], "answer": run.answer, "steps": run.steps,
+                      "tool_calls": run.tool_calls, "pending": [p["reason"] for p in run.pending]}
+        except Exception as exc:
+            record = {"status": "error", "error": ctx.error[:300], "answer": str(exc)[:300], "steps": 0,
+                      "tool_calls": [], "pending": []}
+        self._last_recovery = record
+        self._emit({"type": "escalation", "status": record["status"], "answer": record["answer"]})
+        return record
+
+    def _escalate_step(self, step: RouteStep, error: str, run_gid: str, el: dict | None, item_match) -> str | None:
+        """Returns 'reached' (the page is now where the step should have led), 'ready' (the element can be used now)
+        or None (not solved)."""
+        from .escalation import EscalationContext
+
+        try:
+            shot = self.session.screenshot_png()
+        except Exception:
+            shot = None
+        policy = self._policy or ExplorationPolicy()
+        alternatives = [a["label"] for a in next_actions(self.store, self.key, step.src, policy.max_risk_cost, 5)]
+        ctx = EscalationContext(
+            goal=self._request_text or "continue the automation", failed_step=step, error=error, screenshot_png=shot,
+            graph_neighbourhood={"expected_afterwards": self._state_summary(step.dst) or step.dst,
+                                 "element": {"role": el.get("role"), "name": el.get("name_sample"),
+                                             "locators": (el.get("locators") or [])[:3]} if el else None,
+                                 "alternatives": alternatives},
+            attempts=self._recent_steps(run_gid), policy=policy.to_dict())
+        record = self._run_recovery(ctx)
+        if record["status"] == "needs_approval":
+            return None
+        landed = self.write_state(self.observe())
+        if landed == step.dst:
+            return "reached"
+        return "ready" if el and self.resolver.resolve(el, item_match=item_match) is not None else None
+
+    def _escalate_goal(self, target_gid: str, run_gid: str, error: str) -> bool:
+        """Last resort when re-planning is exhausted: can the recovery agent get the browser to the target screen?"""
+        from .escalation import EscalationContext
+
+        try:
+            shot = self.session.screenshot_png()
+        except Exception:
+            shot = None
+        policy = self._policy or ExplorationPolicy()
+        ctx = EscalationContext(
+            goal=self._request_text or "reach the target screen", failed_step=None, error=error, screenshot_png=shot,
+            graph_neighbourhood={"expected_afterwards": self._state_summary(target_gid) or target_gid},
+            attempts=self._recent_steps(run_gid), policy=policy.to_dict())
+        record = self._run_recovery(ctx)
+        self.activity.add_observation("recovery", {**record, "scope": "goal"}, of_gid=target_gid, of_label="State")
+        self._last_recovery = None
+        if record["status"] == "needs_approval":
+            return False
+        return self.write_state(self.observe()) == target_gid
+
+    def _attach_recovery(self, step_gid: str, el: dict | None) -> None:
+        if self._last_recovery:
+            self.activity.add_observation("recovery", self._last_recovery, step_gid=step_gid,
+                                          of_gid=el["gid"] if el else None)
+            self._last_recovery = None
 
     def execute_step(self, step: RouteStep, run_gid: str, i: int, params: dict,
                      item_match: str | None = None) -> StepOutcome:
@@ -285,21 +431,42 @@ class Navigator:
             if loc:
                 loc.locator.fill(self._input_value(inp, params))
         el = load_element(self.store, self.key, step.el_gid)
+        chosen = None
+        if el and el.get("is_template") and not item_match and self._request_text:
+            # a repeated list: pick the item the request refers to (text, meaning, LLM), else the first item
+            texts = live_item_texts(self.session.page, el)
+            item, how = choose_item(texts, self._request_text, self.embedder, self.llm,
+                                    self.s.item_match_threshold, self.s.item_match_margin)
+            if item:
+                item_match, chosen = item, {"item": item, "method": how, "candidates": len(texts)}
         located = self.resolver.resolve(el, item_match=item_match) if el else None
-        if located is None:
+        error = None if located is not None else "element not found"
+        full_error, clicked, reached = error, None, False
+        if located is not None:
+            try:
+                self._click(located)
+                clicked = located
+            except Exception as exc:
+                full_error, error = str(exc), str(exc)[:300]
+        if clicked is None and self._can_escalate():
+            outcome = self._escalate_step(step, full_error, run_gid, el, item_match)
+            if outcome == "reached":
+                reached, error = True, None
+            elif outcome == "ready":
+                again = self.resolver.resolve(el, item_match=item_match)
+                try:
+                    self._click(again)
+                    clicked, error = again, None
+                except Exception as exc:
+                    error = str(exc)[:300]
+        if clicked is None and not reached:
             self.writer.record_attempt(step.action_gid, False)
             sg = self.activity.add_step(run_gid, i, step.action_type, step.action_gid, step.src, None, ok=False,
-                                        error="element not found", value_var=step.value_var)
+                                        error=error, value_var=step.value_var)
+            self._attach_recovery(sg, el)
             self._emit({"type": "step", "label": step.label, "ok": False})
-            return StepOutcome(False, step.src, False, sg)
-        healed = located.method != "locator:0"
-        try:
-            self._click(located)
-        except Exception as exc:
-            self.writer.record_attempt(step.action_gid, False)
-            sg = self.activity.add_step(run_gid, i, step.action_type, step.action_gid, step.src, None, ok=False,
-                                        error=str(exc)[:300], value_var=step.value_var)
-            return StepOutcome(False, step.src, healed, sg)
+            return StepOutcome(False, step.src, located is not None and located.method != "locator:0", sg)
+        healed = clicked is not None and clicked.method != "locator:0"
         obs = self.observe()
         landed = self.write_state(obs)
         ok = landed == step.dst
@@ -311,23 +478,27 @@ class Navigator:
             self.writer.write_action(step.src, landed, el, step.action_type, step.value_var, step.pre_cstates,
                                      step.requires_inputs, success=True)
         sg = self.activity.add_step(run_gid, i, step.action_type, step.action_gid, step.src, landed, ok=ok,
-                                    healed=healed, heal_method=located.method if healed else None,
+                                    healed=healed, heal_method=clicked.method if healed else None,
                                     latency_ms=int((time.monotonic() - t0) * 1000), value_var=step.value_var)
+        if chosen:
+            self.activity.add_observation("item_choice", chosen, step_gid=sg, of_gid=el["gid"])
         if healed:
-            self._heal_bookkeeping(el, located, sg)
+            self._heal_bookkeeping(el, clicked, sg)
+        self._attach_recovery(sg, el)
         if not ok:
             self.activity.add_observation("unexpected_state", {"expected": step.dst, "landed": landed}, step_gid=sg)
         self._emit({"type": "step", "label": step.label, "ok": ok, "healed": healed}, frame=True)
         return StepOutcome(ok, landed, healed, sg)
 
-    def execute_transition(self, el_gid: str, run_gid: str, i: int, from_state: str) -> StepOutcome:
+    def execute_transition(self, el_gid: str, run_gid: str, i: int, from_state: str,
+                           action: str = "click") -> StepOutcome:
         el = load_element(self.store, self.key, el_gid)
         located = self.resolver.resolve(el) if el else None
         if located is None:
-            sg = self.activity.add_step(run_gid, i, "click", None, from_state, None, ok=False, error="element not found")
+            sg = self.activity.add_step(run_gid, i, action, None, from_state, None, ok=False, error="element not found")
             return StepOutcome(False, from_state, False, sg)
-        self._click(located)
-        sg = self.activity.add_step(run_gid, i, "click", None, from_state, from_state, ok=True,
+        self._act(action, located)
+        sg = self.activity.add_step(run_gid, i, action, None, from_state, from_state, ok=True,
                                     healed=located.method != "locator:0")
         return StepOutcome(True, from_state, located.method != "locator:0", sg)
 
@@ -354,16 +525,24 @@ class Navigator:
                 continue
             replans += 1
             if replans > self.s.max_replans:
+                if self._can_escalate() and self._escalate_goal(
+                        target_gid, run_gid, f"the automation could not reach the target screen after {replans} attempts"):
+                    return "done", target_gid, last, replans, heals
                 return "failed", cur, last, replans, heals
         return "done", cur, last, replans, heals
 
     def execute_goal(self, goal: str, params: dict | None = None, policy: ExplorationPolicy | None = None,
-                     item_match: str | None = None) -> ExecResult:
+                     item_match: str | None = None, request_text: str | None = None) -> ExecResult:
+        """`request_text` is what the user actually said; it is used to choose items of repeated lists
+        (the classifier's short `goal` often drops the item name)."""
         policy, params = policy or ExplorationPolicy(), params or {}
-        targets = [t for t in find_targets(self.store, self.key, self.embedder.embed([goal])[0])
+        self._request_text = request_text or goal
+        self._policy, self._escalations = policy, 0
+        targets = [t for t in find_targets(self.store, self.key, self.embedder.embed([goal])[0],
+                                           text=self._request_text)
                    if t.score >= self.s.min_target_score]
         if targets and targets[0].kind == "Workflow":
-            return self.execute_workflow(targets[0].gid, params, policy, item_match)
+            return self.execute_workflow(targets[0].gid, params, policy, item_match, request_text)
         run = self.activity.start_run("execute", self.agent_id, self.task_id, request=goal)
         states = [t for t in targets if t.kind == "State"]
         if not states:
@@ -375,10 +554,12 @@ class Navigator:
         return ExecResult(run, status, route, cur, replans, heals, text)
 
     def execute_workflow(self, wf_gid: str, params: dict | None = None, policy: ExplorationPolicy | None = None,
-                         item_match: str | None = None) -> ExecResult:
+                         item_match: str | None = None, request_text: str | None = None) -> ExecResult:
         from .workflows import load_workflow_steps
 
         policy, params = policy or ExplorationPolicy(), params or {}
+        self._request_text = request_text or self._request_text
+        self._policy, self._escalations = policy, 0
         steps = load_workflow_steps(self.store, self.key, wf_gid)
         run = self.activity.start_run("execute", self.agent_id, self.task_id, request=f"workflow {wf_gid}")
         self.activity.link_workflow(run, wf_gid)

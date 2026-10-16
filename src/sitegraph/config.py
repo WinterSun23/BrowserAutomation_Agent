@@ -26,6 +26,26 @@ class Settings:
     min_target_score: float = 0.35
     sample_input_text: str = "test"
     headless: bool = True
+    navigators_per_site: int = 2
+    claim_ttl_ms: int = 120000
+    claim_wait_s: float = 5.0
+    claim_retries: int = 3
+    max_scrolls: int = 8
+    agent_max_steps: int = 60          # model turns per request (each may call tools)
+    agent_max_tokens: int = 400000     # token budget per request
+    escalate_navigator: bool = True    # a stuck Navigator step may hand over to an LLM recovery agent (needs a chat LLM)
+    max_escalations_per_run: int = 5   # recovery attempts allowed per execution run
+    escalation_max_steps: int = 30     # model turns one recovery attempt may use
+    escalate_curator: bool = True      # anomalies found after curation may be reviewed by an LLM curator agent
+    curator_max_changes: int = 20      # graph edits one curator review may make
+    anomaly_dup_low: float = 0.6       # states of one page this similar (but below near_dup_threshold) are flagged
+    anomaly_states_per_page: int = 8   # more states than this on one page type is flagged as an explosion
+    anomaly_edge_min_seen: int = 5     # an action tried at least this often ...
+    anomaly_edge_reliability: float = 0.4  # ... with reliability below this is flagged
+    tool_result_max_chars: int = 6000  # tool results shown to an LLM are trimmed to this length
+    item_match_threshold: float = 0.6  # min cosine between request and a live list item to pick it by meaning
+    item_match_margin: float = 0.05    # the best item must beat the runner-up by this much
+    max_path_len: int = 2  # how many chained clicks/hovers may lead to an element (e.g. open menu -> open submenu -> item)
 
     @property
     def blob_dir(self) -> Path:

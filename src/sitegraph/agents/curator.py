@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from itertools import combinations
+
+from ..capture.segment import jaccard
 from ..graph.map_writer import MapWriter
 from ..ids import gid
 from ..llm import complete_json
@@ -25,12 +28,15 @@ class Curator:
             MATCH (p:Page)-[:HAS_STATE]->(s:State) WHERE s.summary IS NULL
             OPTIONAL MATCH (s)-[:COMPOSED_OF]->(cs:ComponentState)<-[:HAS_CSTATE]-(k:Component)
             OPTIONAL MATCH (cs)-[:CONTAINS]->(x:Element)
-            RETURN s.gid, p.title, p.url_template, collect(DISTINCT k.kind), collect(DISTINCT x.name_sample)
+            RETURN s.gid, p.title, p.url_template, collect(DISTINCT k.kind), collect(DISTINCT x.name_sample),
+                   coalesce(p.example_titles, [])
             LIMIT $n""", n=limit)
-        for sg, title, tpl, kinds, names in rows:
+        for sg, title, tpl, kinds, names, examples in rows:
             names = [n for n in names if n][:40]
+            others = [t for t in examples if t != title][:6]
             prompt = (f"Page title: {title}\nURL pattern: {tpl}\nRegions: {', '.join(k for k in kinds if k)}\n"
                       f"Dialog open: {'yes' if 'dialog' in kinds else 'no'}\nInteractive elements: {'; '.join(names)}\n"
+                      + (f"Other pages of this same type: {'; '.join(others)}\n" if others else "") +
                       'Return {"summary": "<one sentence: what this screen is and what a user can do>", '
                       '"intents": ["<2-4 short user goals this screen fulfils, e.g. view shopping cart>"]}')
             data = complete_json(self.llm, _STATE_SYSTEM, prompt,
@@ -39,18 +45,38 @@ class Curator:
                 data = {"summary": f"{title} ({tpl})", "intents": [f"open {title}"]}
             summary = str(data.get("summary") or f"{title} ({tpl})")[:300]
             intents = [str(i)[:120] for i in (data.get("intents") or [])][:4] or [f"open {title}"]
-            vecs = self.embedder.embed([summary] + intents)
-            self.q("MATCH (s:State {gid:$g}) SET s.summary = $sum, s.emb = vecf32($v)", g=sg, sum=summary, v=vecs[0])
-            for text, v in zip(intents, vecs[1:]):
-                ig = gid("in", normalize_text(text))
-                self.q("""MERGE (i:Intent {gid:$ig})
-                          SET i.text = coalesce(i.text, $t), i.source = coalesce(i.source, 'llm'),
-                              i.hits = coalesce(i.hits, 0), i.emb = vecf32($v)
-                          WITH i MATCH (s:State {gid:$g})
-                          MERGE (i)-[f:FULFILLED_BY]->(s) SET f.score = coalesce(f.score, 1.0)""",
-                       ig=ig, t=text, v=v, g=sg)
+            self._store_state(sg, summary, intents, examples)
+        refreshed = self._refresh_examples()
         self._embed_elements()
         self._name_components()
+        return len(rows) + refreshed
+
+    def _store_state(self, sg: str, summary: str, intents: list[str], titles: list[str]) -> None:
+        """Embed a state from its summary plus the titles of the pages of its type seen so far, and attach intents
+        (the LLM's, plus 'open <title>' for each example title), so a request for one instance of a shared page type
+        ('the Travel category') still finds the state whose current name belongs to another instance."""
+        titles = [t for t in titles if t][:8]
+        state_text = summary + (". Examples: " + "; ".join(titles) if titles else "")
+        texts = list(dict.fromkeys(intents + [f"open {t}" for t in titles]))
+        vecs = self.embedder.embed([state_text] + texts)
+        self.q("MATCH (s:State {gid:$g}) SET s.summary = $sum, s.emb = vecf32($v), s.examples_n = $n",
+               g=sg, sum=summary, v=vecs[0], n=len(titles))
+        for text, v in zip(texts, vecs[1:]):
+            ig = gid("in", normalize_text(text))
+            self.q("""MERGE (i:Intent {gid:$ig})
+                      SET i.text = coalesce(i.text, $t), i.source = coalesce(i.source, 'llm'),
+                          i.hits = coalesce(i.hits, 0), i.emb = vecf32($v)
+                      WITH i MATCH (s:State {gid:$g})
+                      MERGE (i)-[f:FULFILLED_BY]->(s) SET f.score = coalesce(f.score, 1.0)""",
+                   ig=ig, t=text, v=v, g=sg)
+
+    def _refresh_examples(self) -> int:
+        """States annotated earlier whose page type has since shown more example titles get re-embedded."""
+        rows = self.ro("""MATCH (p:Page)-[:HAS_STATE]->(s:State)
+                          WHERE s.summary IS NOT NULL AND size(coalesce(p.example_titles, [])) > coalesce(s.examples_n, 0)
+                          RETURN s.gid, s.summary, p.example_titles""")
+        for sg, summary, titles in rows:
+            self._store_state(sg, summary, [], titles)
         return len(rows)
 
     def _embed_elements(self) -> None:
@@ -150,11 +176,62 @@ class Curator:
             self.q("MATCH (r:Run) WHERE r.gid IN $g DETACH DELETE r", g=doomed)
         return len(doomed)
 
-    def run_all(self, max_risk_cost: int) -> dict:
+    # ---------- anomalies (what the escalation agent is asked to review) ----------
+    MAX_FINDINGS = 30
+
+    def find_anomalies(self) -> list[dict]:
+        """Program-side detection of things heuristics cannot settle: near-duplicate states, clashing or generic
+        names, state explosion on one page type, and actions that keep failing."""
+        s = self.s
+        out: list[dict] = []
+        pages = self.ro("""MATCH (p:Page)-[:HAS_STATE]->(st:State)
+                           RETURN p.gid, p.url_template, collect([st.gid, coalesce(st.tokens, []),
+                                  coalesce(st.blocking_sig, ''), coalesce(st.summary, '')])""")
+        for page_gid, tpl, states in pages:
+            if len(states) > s.anomaly_states_per_page:
+                out.append({"kind": "state_explosion", "page": tpl, "states": len(states),
+                            "example_states": [x[0] for x in states[:6]]})
+            pairs = []
+            for (ga, ta, ba, sa), (gb, tb, bb, sb) in combinations(states, 2):
+                if ba != bb:
+                    continue
+                sim = jaccard(set(ta), set(tb))
+                if s.anomaly_dup_low <= sim < s.near_dup_threshold:
+                    pairs.append({"kind": "near_duplicate", "page": tpl, "states": [ga, gb],
+                                  "similarity": round(sim, 2), "summaries": [sa, sb]})
+            out += sorted(pairs, key=lambda p: -p["similarity"])[:5]
+        for summary, gids in self.ro("MATCH (st:State) WHERE st.summary IS NOT NULL RETURN st.summary, collect(st.gid)"):
+            if len(gids) > 1:
+                out.append({"kind": "clashing_names", "summary": summary[:120], "states": gids[:8]})
+            elif len(summary.strip()) < 12:
+                out.append({"kind": "generic_name", "summary": summary, "states": gids})
+        for g, label, seen, ok, rel, src, dst in self.ro(
+                """MATCH (a:State)-[r:ACTION]->(b:State) WHERE r.seen_count >= $n AND r.reliability < $rel
+                   RETURN r.gid, r.label, r.seen_count, r.success_count, r.reliability,
+                          coalesce(a.summary, ''), coalesce(b.summary, '')
+                   ORDER BY r.reliability LIMIT 10""", n=s.anomaly_edge_min_seen, rel=s.anomaly_edge_reliability):
+            out.append({"kind": "failing_edge", "action": g, "label": label, "seen": seen, "successes": ok,
+                        "reliability": round(rel, 2), "from": src[:80], "to": dst[:80]})
+        return out[:self.MAX_FINDINGS]
+
+    def run_all(self, max_risk_cost: int, escalate=None) -> dict:
         annotated = self.annotate()
         self.run_algorithms()
         features = self.build_features()
         self.compute_demo_scores()
         self.refresh_frontiers(max_risk_cost)
         deleted = self.apply_retention()
-        return {"annotated": annotated, "features": features, "runs_deleted": deleted}
+        stats = {"annotated": annotated, "features": features, "runs_deleted": deleted}
+        findings = self.find_anomalies() if escalate is not None else []
+        if findings:
+            review = escalate.review(findings, self)
+            changed = sum(1 for c in review.tool_calls if c["ok"] and c["name"] in (
+                "merge_states", "rename_state", "quarantine_edge", "restore_edge"))
+            if changed:  # the map changed: refresh everything derived from it
+                self.run_algorithms()
+                self.build_features()
+                self.compute_demo_scores()
+                self.refresh_frontiers(max_risk_cost)
+            stats.update(anomalies=len(findings), curation=review.status, curation_changes=changed,
+                         curation_summary=review.answer)
+        return stats

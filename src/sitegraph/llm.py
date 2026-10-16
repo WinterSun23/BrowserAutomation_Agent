@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+from dataclasses import dataclass
 from typing import Callable, Protocol
 
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
@@ -10,6 +11,61 @@ _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
 
 class LLM(Protocol):
     def complete(self, system: str, user: str, image_png: bytes | None = None) -> str: ...
+
+
+# ---------- tool calling (used by the agents) ----------
+@dataclass
+class ToolCall:
+    id: str
+    name: str
+    arguments: dict
+    arguments_error: str | None = None  # set when the model sent arguments that are not a JSON object
+
+
+@dataclass
+class ChatMessage:
+    role: str  # system | user | assistant | tool
+    content: str | None = None
+    tool_calls: list[ToolCall] | None = None  # on assistant messages
+    tool_call_id: str | None = None  # on tool messages
+    name: str | None = None  # on tool messages: which tool answered
+    usage: dict | None = None  # on assistant messages from a real model: token counts
+
+
+class ToolLLM(Protocol):
+    def chat(self, messages: list[ChatMessage], tools: list[dict], image_png: bytes | None = None) -> ChatMessage: ...
+
+
+def to_litellm(msg: ChatMessage) -> dict:
+    """ChatMessage -> the OpenAI-style message dict LiteLLM expects."""
+    if msg.role == "tool":
+        return {"role": "tool", "content": msg.content or "", "tool_call_id": msg.tool_call_id, "name": msg.name}
+    d: dict = {"role": msg.role, "content": msg.content}
+    if msg.tool_calls:
+        d["tool_calls"] = [{"id": c.id, "type": "function",
+                            "function": {"name": c.name, "arguments": json.dumps(c.arguments)}}
+                           for c in msg.tool_calls]
+    return d
+
+
+def from_litellm(message, usage=None) -> ChatMessage:
+    """A LiteLLM / OpenAI response message -> ChatMessage; bad tool arguments never raise."""
+    calls: list[ToolCall] = []
+    for c in getattr(message, "tool_calls", None) or []:
+        raw, args, err = c.function.arguments, {}, None
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    args = parsed
+                else:
+                    err = "arguments must be a JSON object"
+            except (json.JSONDecodeError, TypeError):
+                err = "arguments are not valid JSON"
+        calls.append(ToolCall(id=c.id, name=c.function.name, arguments=args, arguments_error=err))
+    tokens = getattr(usage, "total_tokens", None)
+    return ChatMessage("assistant", content=getattr(message, "content", None) or None, tool_calls=calls or None,
+                       usage={"total_tokens": tokens} if isinstance(tokens, int) else None)
 
 
 def parse_json(text: str | None):
@@ -61,6 +117,47 @@ class LiteLLMClient:
                                   messages=[{"role": "system", "content": system},
                                             {"role": "user", "content": content}])
         return resp.choices[0].message.content or ""
+
+    def chat(self, messages: list[ChatMessage], tools: list[dict], image_png: bytes | None = None) -> ChatMessage:
+        import litellm
+
+        payload = [to_litellm(m) for m in messages]
+        if image_png is not None and payload and payload[-1]["role"] == "user":
+            b64 = base64.b64encode(image_png).decode()
+            payload[-1]["content"] = [{"type": "text", "text": payload[-1]["content"] or ""},
+                                      {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}]
+        resp = litellm.completion(model=self.model, api_base=self.api_base, api_key=self.api_key,
+                                  temperature=self.temperature, messages=payload, tools=tools or None)
+        return from_litellm(resp.choices[0].message, getattr(resp, "usage", None))
+
+
+class OfflineLLM:
+    """Used when no model is configured: every call fails, so `complete_json` returns its built-in defaults
+    (keyword routing, title-based summaries, plain captions). The agent still works, with less polish."""
+
+    def complete(self, system: str, user: str, image_png: bytes | None = None) -> str:
+        raise RuntimeError("no LLM configured (set LLM_API_KEY, or LLM_API_BASE for a local server)")
+
+    def chat(self, messages: list[ChatMessage], tools: list[dict], image_png: bytes | None = None) -> ChatMessage:
+        raise RuntimeError("no LLM configured (set LLM_API_KEY, or LLM_API_BASE for a local server)")
+
+
+class ScriptedLLM:
+    """Test double for tool-calling agents: replays prepared replies in order. Each item is a ChatMessage or a
+    callable (messages, tools) -> ChatMessage. `calls` records what the agent sent."""
+
+    def __init__(self, script: list):
+        self.script = list(script)
+        self.calls: list[tuple[list[ChatMessage], list[dict]]] = []
+        self.images: list[bytes | None] = []
+
+    def chat(self, messages: list[ChatMessage], tools: list[dict], image_png: bytes | None = None) -> ChatMessage:
+        self.calls.append((list(messages), tools))
+        self.images.append(image_png)
+        if not self.script:
+            raise RuntimeError("ScriptedLLM script exhausted")
+        step = self.script.pop(0)
+        return step(messages, tools) if callable(step) else step
 
 
 class FakeLLM:

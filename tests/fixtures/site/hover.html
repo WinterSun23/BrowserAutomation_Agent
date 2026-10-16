@@ -1,0 +1,14 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Hover menu</title>
+<style>
+.sub{display:none;position:absolute;background:#eee;list-style:none;padding:4px;margin:0}
+.has-sub{position:relative;display:inline-block;padding:8px}
+.has-sub:hover .sub{display:block}
+</style></head>
+<body><header><nav aria-label="Main"><ul style="list-style:none;margin:0;padding:0">
+<li class="has-sub"><a href="products.html">Shop</a>
+  <ul class="sub" role="menu">
+    <li role="none"><a role="menuitem" href="about.html">Sub About</a></li>
+    <li role="none"><a role="menuitem" href="orders.html">Sub Orders</a></li>
+  </ul></li>
+<li style="display:inline-block;padding:8px"><a href="index.html">Home</a></li>
+</ul></nav></header><main><h1>Hover menu</h1></main></body></html>

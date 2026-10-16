@@ -41,8 +41,31 @@ class Route:
     probability: float
 
 
-def find_targets(store: GraphStore, key: str, vec: list[float], k: int = 5) -> list[Target]:
+ITEM_TARGET_SCORE = 0.9
+
+
+def _targets_from_list_items(store: GraphStore, key: str, text: str) -> list[Target]:
+    """Screens reached by clicking a list item the request names (e.g. 'Mystery' in 'take me to the mystery
+    category' -> the shared category screen), even if that exact instance was never visited."""
+    from ..browser.items import pick_by_text
+
+    out: list[Target] = []
+    rows = store.ro_query(key, "MATCH (e:Element {is_template:true}) WHERE e.sample_items IS NOT NULL "
+                               "RETURN e.gid, e.sample_items")
+    for el_gid, items in rows:
+        if pick_by_text(list(items), text) is None:
+            continue
+        for g, summary in store.ro_query(key, "MATCH (:State)-[r:ACTION {el_gid:$e}]->(t:State) "
+                                              "RETURN DISTINCT t.gid, coalesce(t.summary, '')", {"e": el_gid}):
+            out.append(Target("State", g, summary, ITEM_TARGET_SCORE))
+    return out
+
+
+def find_targets(store: GraphStore, key: str, vec: list[float], k: int = 5, text: str | None = None) -> list[Target]:
     out: dict[str, Target] = {}
+    if text:
+        for t in _targets_from_list_items(store, key, text):
+            out[t.gid] = t
     rows = store.ro_query(key, """
         CALL db.idx.vector.queryNodes('Intent', 'emb', $k, vecf32($v)) YIELD node
         MATCH (node)-[f:FULFILLED_BY]->(t)
@@ -179,3 +202,20 @@ def state_url(store: GraphStore, key: str, state_gid: str) -> str | None:
     rows = store.ro_query(key, "MATCH (p:Page)-[:HAS_STATE]->(s:State {gid:$g}) RETURN p.example_urls[0]",
                           {"g": state_gid})
     return rows[0][0] if rows else None
+
+
+def recommendations(store: GraphStore, key: str, max_risk_cost: int) -> dict:
+    """Next actions from the entry screen, exploration frontier, suggested workflows and demo candidates."""
+    entry = entry_state(store, key)
+    nexts = next_actions(store, key, entry[0], max_risk_cost) if entry else []
+    demo = store.ro_query(key, """
+        MATCH (s:State) WHERE s.demo_score IS NOT NULL
+        RETURN s.gid, coalesce(s.summary, ''), s.demo_score ORDER BY s.demo_score DESC LIMIT 5""")
+    wfs = store.ro_query(key, """
+        MATCH (w:Workflow) RETURN w.gid, w.name, coalesce(w.demo_score, 0.0), coalesce(w.run_count, 0)
+        ORDER BY coalesce(w.demo_score, 0.0) DESC LIMIT 5""")
+    return {"next_actions": nexts,
+            "frontier": frontier_states(store, key),
+            "suggested_workflows": mine_sequences(store, key),
+            "demo_candidates": [{"gid": g, "summary": s, "score": d} for g, s, d in demo],
+            "workflows": [{"gid": g, "name": n, "demo_score": d, "runs": r} for g, n, d, r in wfs]}

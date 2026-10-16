@@ -1,0 +1,23 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Lazy list</title>
+<style>li.row{height:320px;list-style:none}</style></head>
+<body><main><h1>Lazy list</h1><ul id="lazy" aria-label="Lazy items"></ul></main>
+<script>
+let n = 0, batches = 0, loading = false;
+function addBatch() {
+  const ul = document.getElementById('lazy');
+  for (let i = 0; i < 6; i++) {
+    n++;
+    const li = document.createElement('li'); li.className = 'row';
+    li.innerHTML = '<a href="product.html?id=' + n + '">Lazy item ' + n + '</a>';
+    ul.appendChild(li);
+  }
+  batches++;
+}
+addBatch();
+window.addEventListener('scroll', () => {
+  if (!loading && batches < 4 && window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 50) {
+    loading = true;
+    setTimeout(() => { addBatch(); loading = false; }, 100);
+  }
+});
+</script></body></html>

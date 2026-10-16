@@ -84,6 +84,11 @@ def _destinations_agree(nodes: list[RawNode], pos: list[int]) -> bool:
     return True
 
 
+def _hoverable(n: RawNode) -> bool:
+    s = n.states or {}
+    return s.get("haspopup") not in (None, "", "false") or s.get("popup") == "true"
+
+
 def _identity_key(n: RawNode) -> str:
     if n.role == "link" and n.href:
         return "href:" + url_template(n.href)
@@ -176,7 +181,8 @@ def build_state(raw: RawSnapshot, domain: str, template_min: int = 4) -> StateOb
                           input_kind=(n.input_type or "text") if n.role in ("textbox", "searchbox")
                           else _INPUT_KIND.get(n.role),
                           href_template=url_template(n.href) if n.href else None,
-                          in_form=comp_gids.get(form_idx) if form_idx is not None else None)
+                          in_form=comp_gids.get(form_idx) if form_idx is not None else None,
+                          hoverable=_hoverable(n))
             if n.idx in tpl_rep:
                 t, j = tpl_rep[n.idx]
                 pos = t.positions[j]
@@ -190,7 +196,7 @@ def build_state(raw: RawSnapshot, domain: str, template_min: int = 4) -> StateOb
                     gid=gid("el", comp_gid, n.role, key if key.startswith("href:") else tname, "tpl", item.gcss),
                     name_norm=tname, locators=[f"item={item.gcss}||{rel}"], is_template=True, count=len(t.items),
                     item_locator=f"css={item.gcss}", item_key_fields=key_fields,
-                    sample_items=[sample_text(nodes[i].name, 80) for i in t.items[:5]], **common))
+                    sample_items=[sample_text(nodes[i].name, 80) for i in t.items[:60]], **common))
                 continue
             sib = seen[(n.role, key)]
             seen[(n.role, key)] += 1

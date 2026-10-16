@@ -15,6 +15,14 @@ _SETTLE_JS = """(quiet) => new Promise(res => {
   mo.observe(document, {subtree: true, childList: true, attributes: true});
   t = setTimeout(done, quiet); setTimeout(done, 3000);
 })"""
+_SCROLL_JS = """async () => {
+  const de = document.documentElement;
+  if (de.scrollHeight <= window.innerHeight + 4) return false;
+  const h0 = de.scrollHeight;
+  window.scrollTo(0, h0);
+  await new Promise(r => setTimeout(r, 250));
+  return de.scrollHeight > h0;
+}"""
 _DEVICES = {"phone": "iPhone 13", "tablet": "iPad Pro 11"}
 
 
@@ -30,6 +38,7 @@ class BrowserSession:
         self.browser = self._pw.chromium.launch(headless=self.headless)
         args: dict = dict(self._pw.devices[_DEVICES[self.device]]) if self.device in _DEVICES else \
             {"viewport": {"width": 1280, "height": 720}}
+        args.pop("default_browser_type", None)  # a device-descriptor field that new_context() does not accept
         if self.record_video_dir:
             args["record_video_dir"] = str(self.record_video_dir)
             args["record_video_size"] = {"width": self.video_size[0], "height": self.video_size[1]}
@@ -59,6 +68,21 @@ class BrowserSession:
             self.page.evaluate(_SETTLE_JS, quiet_ms)
         except Exception:
             pass  # page navigated mid-evaluation; the next snapshot re-reads the DOM
+
+    def load_all(self, max_scrolls: int = 8) -> int:
+        """Scroll down in steps until the page stops growing (lazy / infinite loading), then back to the top.
+        Short pages return immediately. Returns how many scroll steps loaded more content."""
+        grown = 0
+        try:
+            for _ in range(max_scrolls):
+                if not self.page.evaluate(_SCROLL_JS):
+                    break
+                grown += 1
+                self.settle(150)
+            self.page.evaluate("window.scrollTo(0, 0)")
+        except Exception:
+            pass  # page navigated mid-scroll; the next snapshot re-reads the DOM
+        return grown
 
     def snapshot(self) -> RawSnapshot:
         return RawSnapshot.from_dict(self.page.evaluate(EXTRACT_JS))

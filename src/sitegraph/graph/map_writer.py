@@ -18,7 +18,10 @@ SET p.url_template = $tpl, p.title = $title, p.first_seen = coalesce(p.first_see
     p.seen_count = coalesce(p.seen_count, 0) + 1,
     p.example_urls = CASE WHEN p.example_urls IS NULL THEN [$url]
                           WHEN $url IN p.example_urls OR size(p.example_urls) >= 5 THEN p.example_urls
-                          ELSE p.example_urls + [$url] END"""
+                          ELSE p.example_urls + [$url] END,
+    p.example_titles = CASE WHEN p.example_titles IS NULL THEN [$title]
+                            WHEN $title IN p.example_titles OR size(p.example_titles) >= 8 THEN p.example_titles
+                            ELSE p.example_titles + [$title] END"""
 
 _STATE = """MATCH (p:Page {gid:$pg})
 MERGE (s:State {gid:$sg})

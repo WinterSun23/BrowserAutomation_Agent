@@ -1,0 +1,9 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Category</title></head>
+<body><main><h1 id="h">Category</h1><p>Books in this category.</p>
+<a href="categories.html">Back to categories</a></main>
+<script>
+const name = new URLSearchParams(location.search).get('name') || 'unknown';
+const label = name.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+document.title = 'Category: ' + label;
+document.getElementById('h').textContent = label;
+</script></body></html>
