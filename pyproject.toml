@@ -1,0 +1,37 @@
+[project]
+name = "sitegraph"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "falkordb>=1.0.4",
+  "redis>=5.0",
+  "playwright>=1.48",
+  "sentence-transformers>=3.0",
+  "litellm>=1.50",
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "pyyaml>=6.0",
+  "pillow>=10.4",
+  "imageio-ffmpeg>=0.5.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "httpx>=0.27"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+sitegraph = ["capture/*.js", "demo/*.js", "web/static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "integration: needs FalkorDB on localhost:6379 (docker compose up -d)",
+  "browser: needs Playwright chromium (playwright install chromium)",
+  "slow: records video / runs ffmpeg",
+]

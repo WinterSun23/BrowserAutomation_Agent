@@ -1,0 +1,15 @@
+uid: local
+falkor_host: localhost
+falkor_port: 6379
+data_dir: data
+embed_model: BAAI/bge-small-en-v1.5
+embed_dim: 384
+llm_model: openai/gpt-4o-mini
+retention_runs: 100
+near_dup_threshold: 0.85
+cost_lambda: 2.0
+max_replans: 3
+template_min_items: 4
+min_target_score: 0.35
+sample_input_text: test
+headless: true

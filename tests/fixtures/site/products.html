@@ -1,0 +1,12 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Products</title><script src="shop.js"></script></head>
+<body><main><h1>Products</h1>
+<ul class="grid" aria-label="Product list">
+  <li class="card"><article><a href="product.html?id=1">Blue T-shirt</a><p>$12.00</p><button onclick="addToCart('Blue T-shirt')">Add to cart</button></article></li>
+  <li class="card"><article><a href="product.html?id=2">Red Hoodie</a><p>$30.00</p><button onclick="addToCart('Red Hoodie')">Add to cart</button></article></li>
+  <li class="card"><article><a href="product.html?id=3">Green Cap</a><p>$9.00</p><button onclick="addToCart('Green Cap')">Add to cart</button></article></li>
+  <li class="card"><article><a href="product.html?id=4">Black Jeans</a><p>$45.00</p><button onclick="addToCart('Black Jeans')">Add to cart</button></article></li>
+  <li class="card"><article><a href="product.html?id=5">White Socks</a><p>$5.00</p><button onclick="addToCart('White Socks')">Add to cart</button></article></li>
+  <li class="card"><article><a href="product.html?id=6">Yellow Scarf</a><p>$15.00</p><button onclick="addToCart('Yellow Scarf')">Add to cart</button></article></li>
+</ul></main>
+<dialog id="added-dialog" aria-label="Added to cart"><p>Added <span id="added-name"></span> to cart.</p><a href="cart.html">Go to cart</a> <button onclick="this.closest('dialog').close()">Close</button></dialog>
+</body></html>
