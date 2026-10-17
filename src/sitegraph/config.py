@@ -5,6 +5,7 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 
 import yaml
+from dotenv import dotenv_values
 
 
 @dataclass
@@ -75,14 +76,20 @@ def _coerce(value, current):
     return value
 
 
-def load_settings(path: str | Path | None = "config.yaml") -> Settings:
+def load_settings(path: str | Path | None = "config.yaml", env_file: str | Path | None = None) -> Settings:
+    """Defaults < config.yaml < .env < real environment variables. The .env file is read into the settings only;
+    it never changes os.environ. `env_file` defaults to $SITEGRAPH_ENV_FILE, else '.env'; an empty value disables it."""
+    if env_file is None:
+        env_file = os.environ.get("SITEGRAPH_ENV_FILE", ".env")
     s = Settings()
     if path and Path(path).exists():
         data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
         for f in fields(Settings):
             if f.name in data:
                 setattr(s, f.name, _coerce(data[f.name], getattr(s, f.name)))
+    env_values = dotenv_values(env_file) if env_file and Path(env_file).exists() else {}
+    env_values = {**{k: v for k, v in env_values.items() if v is not None}, **os.environ}
     for name, env in _ENV.items():
-        if env in os.environ:
-            setattr(s, name, _coerce(os.environ[env], getattr(s, name)))
+        if env in env_values:
+            setattr(s, name, _coerce(env_values[env], getattr(s, name)))
     return s

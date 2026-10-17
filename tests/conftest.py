@@ -1,10 +1,16 @@
 import functools
 import http.server
+import os
 import threading
 import uuid
 from pathlib import Path
 
 import pytest
+
+# Tests never read the developer's .env (it may point at a real model); subprocesses inherit this too.
+# LiteLLM loads .env into os.environ on import unless LITELLM_MODE is set to something other than DEV.
+os.environ["SITEGRAPH_ENV_FILE"] = ""
+os.environ["LITELLM_MODE"] = "PRODUCTION"
 
 from sitegraph.config import Settings
 from sitegraph.db import GraphStore
