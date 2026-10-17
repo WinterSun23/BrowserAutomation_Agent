@@ -29,7 +29,8 @@ SET s.first_seen = coalesce(s.first_seen, $now), s.last_seen = $now, s.seen_coun
     s.tokens = coalesce(s.tokens, $tokens), s.skeleton_hash = coalesce(s.skeleton_hash, $sk),
     s.blocking_sig = coalesce(s.blocking_sig, $bsig), s.aliases = coalesce(s.aliases, []),
     s.untried_count = coalesce(s.untried_count, 0),
-    s.screenshot_ref = coalesce(s.screenshot_ref, $shot), s.snapshot_ref = coalesce(s.snapshot_ref, $snap)
+    s.screenshot_ref = coalesce(s.screenshot_ref, $shot), s.snapshot_ref = coalesce(s.snapshot_ref, $snap),
+    s.phash = coalesce(s.phash, $phash)
 MERGE (p)-[:HAS_STATE]->(s)"""
 
 _COMPONENTS = """UNWIND $comps AS c
@@ -124,14 +125,15 @@ class MapWriter:
                 best, best_sim = g, sim
         return best
 
-    def write_state(self, obs: StateObs, screenshot_ref: str | None = None, snapshot_ref: str | None = None) -> str:
+    def write_state(self, obs: StateObs, screenshot_ref: str | None = None, snapshot_ref: str | None = None,
+                    phash: str | None = None) -> str:
         now = self.now()
         canon = self.resolve_state(obs)
         new = canon is None
         sg = canon or obs.state_gid
         self.q(_PAGE, pg=obs.page_gid, tpl=obs.url_template, url=obs.url, title=obs.title, now=now)
         self.q(_STATE, pg=obs.page_gid, sg=sg, tokens=obs.tokens, sk=obs.skeleton_hash, bsig=obs.blocking_sig,
-               shot=screenshot_ref, snap=snapshot_ref, now=now)
+               shot=screenshot_ref, snap=snapshot_ref, phash=phash, now=now)
         if canon and canon != obs.state_gid:
             self.q("MATCH (s:State {gid:$sg}) WHERE NOT $a IN s.aliases SET s.aliases = s.aliases + [$a]",
                    sg=sg, a=obs.state_gid)
@@ -149,6 +151,16 @@ class MapWriter:
         if els:
             self.q(_ELEMENTS, els=els, now=now)
         return sg
+
+    def cstates_without_shot(self, gids: list[str]) -> set[str]:
+        if not gids:
+            return set()
+        rows = self.ro("MATCH (c:ComponentState) WHERE c.gid IN $g AND c.screenshot_ref IS NULL RETURN c.gid", g=gids)
+        return {r[0] for r in rows}
+
+    def set_cstate_shot(self, cs_gid: str, ref: str) -> None:
+        self.q("MATCH (c:ComponentState {gid:$g}) WHERE c.screenshot_ref IS NULL SET c.screenshot_ref = $r",
+               g=cs_gid, r=ref)
 
     def write_action(self, src: str, dst: str, el: dict, action_type: str = "click", value_var: str | None = None,
                      pre_cstates=(), requires_inputs=(), success: bool = True) -> str:

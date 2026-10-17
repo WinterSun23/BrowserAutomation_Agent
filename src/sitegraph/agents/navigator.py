@@ -17,6 +17,7 @@ from ..ids import ulid
 from ..normalize import domain_of, var_name
 from ..ops import Ops
 from ..policy import ExplorationPolicy, robots_allowed
+from ..visual import crop_png, dhash, hamming_hex
 
 
 @dataclass
@@ -86,11 +87,41 @@ class Navigator:
         return build_state(self.session.snapshot(), self.domain, self.s.template_min_items)
 
     def write_state(self, obs: StateObs) -> str:
-        shot = snap = None
-        if self.blobs is not None and self.writer.resolve_state(obs) is None:
-            shot = self.blobs.put_screenshot(self.session.screenshot_png())
+        """Screenshot policy: a full screenshot (and its dHash) for a new state only, one crop per component state
+        that has none yet, and nothing for states already known."""
+        if self.blobs is None:
+            return self.writer.write_state(obs)
+        new = self.writer.resolve_state(obs) is None
+        png = shot = snap = ph = None
+        if new:
+            png = self.session.screenshot_png()
+            shot, ph = self.blobs.put_screenshot(png), dhash(png)
             snap = self.blobs.put_json_gz(obs.raw.to_dict()) if obs.raw else None
-        return self.writer.write_state(obs, screenshot_ref=shot, snapshot_ref=snap)
+        sg = self.writer.write_state(obs, screenshot_ref=shot, snapshot_ref=snap, phash=ph)
+        missing = self.writer.cstates_without_shot([c.cs_gid for c in obs.components if c.root_bbox])
+        if missing:
+            png = png or self.session.screenshot_png()
+            for c in obs.components:
+                if c.cs_gid in missing:
+                    self.writer.set_cstate_shot(c.cs_gid, self.blobs.put_screenshot(crop_png(png, c.root_bbox)))
+        return sg
+
+    def _evidence(self) -> str | None:
+        """A screenshot kept as evidence of a failure, heal or unexpected state (never for plain successes)."""
+        if self.blobs is None:
+            return None
+        try:
+            return self.blobs.put_screenshot(self.session.screenshot_png())
+        except Exception:
+            return None
+
+    def _visual_diff(self, before_png: bytes, el: ElementObs, step_gid: str) -> None:
+        """A click that changed neither the state nor a component may still have changed the page visibly."""
+        after_png = self.session.screenshot_png()
+        if hamming_hex(dhash(before_png), dhash(after_png)) > self.s.visual_diff_bits and self.blobs is not None:
+            self.activity.add_observation("visual_diff", {"element": el.name_sample[:80]}, step_gid=step_gid,
+                                          of_gid=el.gid, before_ref=self.blobs.put_screenshot(before_png),
+                                          after_ref=self.blobs.put_screenshot(after_png))
 
     def _emit(self, event: dict, frame: bool = False) -> None:
         if self.events is None:
@@ -222,6 +253,7 @@ class Navigator:
             requires, value_var = ([], None)
             if kind == "click" and el.in_form and policy.allow_forms:
                 requires, value_var = self._fill_form(before, el)
+            before_png = self.session.screenshot_png() if self.blobs is not None else None
             t_click = time.monotonic()
             self._act(kind, loc)
             after = self.observe()
@@ -262,8 +294,10 @@ class Navigator:
                         self._add_items(scope, url, depth, fresh, pre + (token,), pre_cstates + (dstc,))
         if kind == "click":
             self.writer.mark_tried(el.gid)
-        self.activity.add_step(run, step_i, kind, edge_gid, before_gid, dst, ok=True, latency_ms=latency,
-                               value_var=value_var)
+        step_gid = self.activity.add_step(run, step_i, kind, edge_gid, before_gid, dst, ok=True, latency_ms=latency,
+                                          value_var=value_var)
+        if edge_gid is None and before_png is not None:
+            self._visual_diff(before_png, el, step_gid)
         self._emit({"type": "step", "label": f"{kind} '{el.name_sample[:40]}'", "ok": True}, frame=True)
         return step_i + 1
 
@@ -495,7 +529,7 @@ class Navigator:
         if clicked is None and not reached:
             self.writer.record_attempt(step.action_gid, False)
             sg = self.activity.add_step(run_gid, i, step.action_type, step.action_gid, step.src, None, ok=False,
-                                        error=error, value_var=step.value_var)
+                                        error=error, value_var=step.value_var, screenshot_ref=self._evidence())
             self._attach_recovery(sg, el)
             self._emit({"type": "step", "label": step.label, "ok": False})
             return StepOutcome(False, step.src, located is not None and located.method != "locator:0", sg)
@@ -513,7 +547,8 @@ class Navigator:
                                      step.requires_inputs, success=True)
         sg = self.activity.add_step(run_gid, i, step.action_type, step.action_gid, step.src, landed, ok=ok,
                                     healed=healed, heal_method=clicked.method if healed else None,
-                                    latency_ms=int((time.monotonic() - t0) * 1000), value_var=step.value_var)
+                                    latency_ms=int((time.monotonic() - t0) * 1000), value_var=step.value_var,
+                                    screenshot_ref=self._evidence() if (healed or not ok) else None)
         if chosen:
             self.activity.add_observation("item_choice", chosen, step_gid=sg, of_gid=el["gid"])
         if healed:

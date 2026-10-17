@@ -79,6 +79,7 @@ class ComponentObs:
     skeleton_hash: str
     aria_state: dict
     elements: list[ElementObs]
+    root_bbox: list | None = None
 
 
 @dataclass

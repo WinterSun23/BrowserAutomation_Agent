@@ -219,7 +219,8 @@ def build_state(raw: RawSnapshot, domain: str, template_min: int = 4) -> StateOb
         components.append(ComponentObs(gid=comp_gid, kind=kind, name=sample_text(root.name if root else "", 80),
                                        blocking=blocking, ephemeral=ephemeral, root_css=root.gcss if root else "body",
                                        cs_gid=cs_gid, cs_name=cs_name, skeleton_hash=skeleton_hash,
-                                       aria_state=aria_state, elements=elements))
+                                       aria_state=aria_state, elements=elements,
+                                       root_bbox=root.bbox if root else None))
 
     identity = [c for c in components if not c.ephemeral]
     state_gid = gid("st", page_gid, *sorted(c.cs_gid for c in identity))
