@@ -34,13 +34,14 @@ def _formats_named_in(text: str) -> list[str]:
     return found
 
 
-def interpret(llm, text: str, prefs: dict | None = None) -> DemoSpec:
+def interpret(llm, text: str, prefs: dict | None = None, memories: list | None = None) -> DemoSpec:
     prefs = prefs or {}
     default = {"formats": _formats_named_in(text) or [prefs.get("demo.format", "video")],
                "scope_kind": "goal", "target": text,
                "audience": "general", "max_seconds": 60}
     data = complete_json(llm, _SYSTEM,
                          f"Request: {text}\nUser preferences: {json.dumps(prefs)}\n"
+                         f"Relevant memories: {memories or []}\n"
                          f"Return JSON with keys: formats (subset of {FORMATS}), scope_kind (one of {SCOPES}; "
                          "workflow=a saved automation, goal=how to reach something, state=one screen, "
                          "transition=a small interaction like opening a menu, feature=an area of the site), "

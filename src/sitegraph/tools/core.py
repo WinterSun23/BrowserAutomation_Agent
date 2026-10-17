@@ -120,6 +120,7 @@ class ToolContext:
     profile: Any = None
     device: str = "desktop"
     blobs: Any = None
+    writer: Any = None                    # MapWriter / RecordingMapWriter for map edits (None: a plain one is made)
     approvals: ApprovalGate = field(default_factory=ApprovalGate)
     session: Any = None
     approved: bool = False                # True while running a call the human approved
@@ -182,7 +183,7 @@ class Toolbox:
             return ToolResult(False, error=f"the user denied this action ({reason}); do not retry it")
         rid = gate.request(name, args, reason)
         return ToolResult(False, error=f"needs the user's approval: {reason}",
-                          needs_approval={"id": rid, "tool": name, "args": args, "reason": reason})
+                          needs_approval={"id": rid, "tool": name, "args": self.redacted(name, args), "reason": reason})
 
     def call(self, name: str, args: dict) -> ToolResult:
         spec = self._tools.get(name)

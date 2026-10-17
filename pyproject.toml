@@ -16,6 +16,7 @@ dependencies = [
   "mcp>=2.3,<3",
   "pillow>=10.4",
   "imageio-ffmpeg>=0.5.1",
+  "keyring>=25.0",
 ]
 
 [project.optional-dependencies]

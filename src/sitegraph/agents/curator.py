@@ -51,17 +51,23 @@ class Curator:
         self._name_components()
         return len(rows) + refreshed
 
-    def _store_state(self, sg: str, summary: str, intents: list[str], titles: list[str]) -> None:
-        """Embed a state from its summary plus the titles of the pages of its type seen so far, and attach intents
-        (the LLM's, plus 'open <title>' for each example title), so a request for one instance of a shared page type
-        ('the Travel category') still finds the state whose current name belongs to another instance."""
+    def state_embeddings(self, summary: str, intents: list[str], titles: list[str]) -> tuple[list, list, list]:
+        """(titles kept, the state's vector, [(intent text, vector)]): summary plus example titles are embedded as one
+        text; every intent and every 'open <title>' gets its own vector. Shared by annotation and the review agent."""
         titles = [t for t in titles if t][:8]
         state_text = summary + (". Examples: " + "; ".join(titles) if titles else "")
         texts = list(dict.fromkeys(intents + [f"open {t}" for t in titles]))
         vecs = self.embedder.embed([state_text] + texts)
+        return titles, vecs[0], list(zip(texts, vecs[1:]))
+
+    def _store_state(self, sg: str, summary: str, intents: list[str], titles: list[str]) -> None:
+        """Embed a state from its summary plus the titles of the pages of its type seen so far, and attach intents
+        (the LLM's, plus 'open <title>' for each example title), so a request for one instance of a shared page type
+        ('the Travel category') still finds the state whose current name belongs to another instance."""
+        titles, state_vec, intent_vecs = self.state_embeddings(summary, intents, titles)
         self.q("MATCH (s:State {gid:$g}) SET s.summary = $sum, s.emb = vecf32($v), s.examples_n = $n",
-               g=sg, sum=summary, v=vecs[0], n=len(titles))
-        for text, v in zip(texts, vecs[1:]):
+               g=sg, sum=summary, v=state_vec, n=len(titles))
+        for text, v in intent_vecs:
             ig = gid("in", normalize_text(text))
             self.q("""MERGE (i:Intent {gid:$ig})
                       SET i.text = coalesce(i.text, $t), i.source = coalesce(i.source, 'llm'),

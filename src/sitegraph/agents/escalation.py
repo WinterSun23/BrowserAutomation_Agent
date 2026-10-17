@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass, field
 
 from ..graph.queries import RouteStep
-from ..llm import OfflineLLM
+from ..llm import can_call_tools
 from ..policy import ExplorationPolicy
 from ..tools import ToolContext, build_toolbox
 from .loop import AgentLoop, AgentRun
@@ -90,7 +90,7 @@ class NavigatorEscalation:
 
 def make_escalation(settings, store, key, domain, embedder, llm, blobs=None, device: str = "desktop"):
     """A NavigatorEscalation when the LLM can call tools and escalation is enabled, otherwise None."""
-    if not settings.escalate_navigator or llm is None or isinstance(llm, OfflineLLM) or not hasattr(llm, "chat"):
+    if not settings.escalate_navigator or not can_call_tools(llm):
         return None
     return NavigatorEscalation(llm, settings, store, key, domain, embedder, blobs, device)
 
@@ -134,6 +134,6 @@ class CuratorEscalation:
 
 def make_curator_escalation(settings, store, key, embedder, llm):
     """A CuratorEscalation when the LLM can call tools and curator escalation is enabled, otherwise None."""
-    if not settings.escalate_curator or llm is None or isinstance(llm, OfflineLLM) or not hasattr(llm, "chat"):
+    if not settings.escalate_curator or not can_call_tools(llm):
         return None
     return CuratorEscalation(llm, settings, store, key, embedder)

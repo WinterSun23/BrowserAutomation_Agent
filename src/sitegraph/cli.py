@@ -4,6 +4,7 @@ import argparse
 import builtins
 import json
 import sys
+from dataclasses import dataclass
 
 from .agents.execution_agent import ExecutionAgent
 from .agents.loop import AgentRun
@@ -11,10 +12,11 @@ from .agents.orchestrator import Orchestrator
 from .blobs import BlobStore
 from .config import Settings, load_settings
 from .db import GraphStore
-from .embed import BgeEmbedder, HashEmbedder
+from .embed import BgeEmbedder, CachedEmbedder, HashEmbedder
 from .events import NullEvents
-from .llm import LiteLLMClient, OfflineLLM
+from .llm import LiteLLMClient, OfflineLLM, TracingLLM, can_call_tools, has_model
 from .ops import Ops
+from .tools import ToolContext, build_toolbox
 
 
 def make_llm(settings: Settings):
@@ -22,6 +24,44 @@ def make_llm(settings: Settings):
     if settings.llm_api_key or settings.llm_api_base:
         return LiteLLMClient(settings.llm_model, settings.llm_api_base, settings.llm_api_key)
     return OfflineLLM()
+
+
+@dataclass
+class Runtime:
+    settings: Settings
+    store: GraphStore
+    embedder: object
+    llm: object
+    blobs: BlobStore
+
+
+def build_runtime(args: argparse.Namespace, quiet: bool = False) -> Runtime | None:
+    """Everything the commands share: settings, the graph store, and the embedder and LLM wrapped for caching and
+    tracing. Returns None (after saying why) when FalkorDB cannot be reached."""
+    settings = load_settings(args.config)
+    if args.uid:
+        settings.uid = args.uid
+    try:
+        store = GraphStore(settings.falkor_host, settings.falkor_port)
+        store.redis.ping()
+    except Exception as exc:
+        print(f"Cannot reach FalkorDB at {settings.falkor_host}:{settings.falkor_port} ({exc}).\n"
+              "Start it with: docker compose up -d", file=sys.stderr)
+        return None
+    llm = make_llm(settings)
+    if not has_model(llm) and not quiet:
+        print("No LLM configured: using built-in defaults (keyword routing, plain summaries and captions). "
+              "Set LLM_API_KEY to enable a model.", file=sys.stderr)
+    if args.embedder == "bge":
+        if not quiet:
+            print(f"Loading embedding model {settings.embed_model} (downloads on first use)...", file=sys.stderr)
+        embedder = BgeEmbedder(settings.embed_model)
+    else:
+        embedder = HashEmbedder(settings.embed_dim)
+    # sensitive tool arguments (typed values, secrets) are hidden in the per-run traces
+    redact = build_toolbox(ToolContext(settings=settings)).redacted
+    return Runtime(settings, store, CachedEmbedder(embedder, settings.data_dir / "embed_cache.sqlite"),
+                   TracingLLM(llm, settings.data_dir / "traces", redact=redact), BlobStore(settings.blob_dir))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -54,26 +94,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> int:
-    settings = load_settings(args.config)
-    if args.uid:
-        settings.uid = args.uid
-    try:
-        store = GraphStore(settings.falkor_host, settings.falkor_port)
-        store.redis.ping()
-    except Exception as exc:
-        print(f"Cannot reach FalkorDB at {settings.falkor_host}:{settings.falkor_port} ({exc}).\n"
-              "Start it with: docker compose up -d", file=sys.stderr)
+    rt = build_runtime(args)
+    if rt is None:
         return 2
-    llm = make_llm(settings)
-    if isinstance(llm, OfflineLLM):
-        print("No LLM configured: using built-in defaults (keyword routing, plain summaries and captions). "
-              "Set LLM_API_KEY to enable a model.", file=sys.stderr)
-    if args.embedder == "bge":
-        print(f"Loading embedding model {settings.embed_model} (downloads on first use)...", file=sys.stderr)
-        embedder = BgeEmbedder(settings.embed_model)
-    else:
-        embedder = HashEmbedder(settings.embed_dim)
-    orch = Orchestrator(settings, store, embedder, llm, BlobStore(settings.blob_dir), NullEvents())
+    settings, store, embedder, llm = rt.settings, rt.store, rt.embedder, rt.llm
+    orch = Orchestrator(settings, store, embedder, llm, rt.blobs, NullEvents())
     site = orch.register_site(args.site, args.device)
     ops = Ops(store, settings.uid, site.domain)
     failed = False
@@ -110,23 +135,16 @@ def converse(agent, text: str, input_fn, write) -> AgentRun:
 
 def chat(args: argparse.Namespace, input_fn=None, write=print) -> int:
     input_fn = input_fn or builtins.input
-    settings = load_settings(args.config)
-    if args.uid:
-        settings.uid = args.uid
-    try:
-        store = GraphStore(settings.falkor_host, settings.falkor_port)
-        store.redis.ping()
-    except Exception as exc:
-        print(f"Cannot reach FalkorDB at {settings.falkor_host}:{settings.falkor_port} ({exc}).\n"
-              "Start it with: docker compose up -d", file=sys.stderr)
+    rt = build_runtime(args, quiet=True)
+    if rt is None:
         return 2
-    llm = make_llm(settings)
-    embedder = (BgeEmbedder(settings.embed_model) if args.embedder == "bge" else HashEmbedder(settings.embed_dim))
-    blobs = BlobStore(settings.blob_dir)
+    settings, store, embedder, llm, blobs = rt.settings, rt.store, rt.embedder, rt.llm, rt.blobs
     orch = Orchestrator(settings, store, embedder, llm, blobs, NullEvents())
     site = orch.register_site(args.site, args.device)
-    use_agent = not isinstance(llm, OfflineLLM) and not args.no_agent
+    use_agent = can_call_tools(llm) and not args.no_agent
     agent = ExecutionAgent(settings, store, embedder, llm, blobs, site, orch.profile) if use_agent else None
+    if agent is not None:
+        agent.ctx.extra["orchestrator"] = orch            # lets the agent queue background tasks (submit_task)
     if not use_agent:
         print("No LLM agent: " + ("--no-agent given" if args.no_agent else "no LLM configured (set LLM_API_KEY)") +
               ". Using the fixed request pipeline (explore / open a screen / make a demo / recommend).",
@@ -163,22 +181,15 @@ def serve_mcp(args: argparse.Namespace) -> int:
     from .mcp_server import build_server, serve_stdio
     from .tools import ToolContext, build_toolbox
 
-    settings = load_settings(args.config)
-    if args.uid:
-        settings.uid = args.uid
-    try:
-        store = GraphStore(settings.falkor_host, settings.falkor_port)
-        store.redis.ping()
-    except Exception as exc:
-        print(f"Cannot reach FalkorDB at {settings.falkor_host}:{settings.falkor_port} ({exc}).", file=sys.stderr)
+    rt = build_runtime(args, quiet=True)
+    if rt is None:
         return 2
-    llm = make_llm(settings)
-    embedder = BgeEmbedder(settings.embed_model) if args.embedder == "bge" else HashEmbedder(settings.embed_dim)
-    blobs = BlobStore(settings.blob_dir)
+    settings, store, embedder, llm, blobs = rt.settings, rt.store, rt.embedder, rt.llm, rt.blobs
     orch = Orchestrator(settings, store, embedder, llm, blobs, NullEvents())
     site = orch.register_site(args.site, args.device)
     ctx = ToolContext(settings=settings, store=store, key=site.key, domain=site.domain, embedder=embedder, llm=llm,
-                      policy=orch.profile.default_policy(), profile=orch.profile, device=args.device, blobs=blobs)
+                      policy=orch.profile.policy_for(site.domain, args.device), profile=orch.profile, device=args.device, blobs=blobs)
+    ctx.extra["orchestrator"] = orch
     server = build_server(build_toolbox(ctx))
     print(f"SiteGraph MCP server for {site.domain} ready (stdio).", file=sys.stderr)
     try:

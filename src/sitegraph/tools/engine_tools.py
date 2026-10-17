@@ -10,15 +10,14 @@ from ..agents.workflows import save_workflow_from_run
 from ..db import ops_key
 from ..agents.demo_agent import DemoAgent
 from ..events import NullEvents
+from ..git import GitOps
 from ..graph.queries import entry_state
 from ..normalize import normalize_text
+from ..profile import SENSITIVE_TEXT
 from .browser_tools import get_nav
 from .core import ToolContext, ToolResult, ToolSpec, Toolbox
 from .graph_tools import policy_of
 
-_SENSITIVE_MEMORY = re.compile(
-    r"(password|passwd|passcode|api[ _-]?key|secret|token|credit card|card number|ssn|\b[\w.+-]+@[\w-]+\.[\w.]+\b|\d{9,})",
-    re.I)
 
 
 def _risky_element_named_in(ctx: ToolContext, goal: str) -> dict | None:
@@ -91,6 +90,12 @@ def _explore(ctx: ToolContext, args: dict):
     orch = Orchestrator(ctx.settings, ctx.store, ctx.embedder, ctx.llm, ctx.blobs, NullEvents())
     site = SiteInfo(ctx.domain, ctx.device, ctx.key, ops_key(ctx.settings.uid, ctx.domain), entry)
     policy = policy_of(ctx)
+    if ctx.settings.use_git:
+        # one branch per browser, merged by the Curator (which also recomputes the algorithms)
+        res = orch._explore_git(site, policy, "chat-explore", n)
+        return {"states": res["states"], "actions": res["actions"], "transitions": res["transitions"],
+                "blocked_as_risky": res["blocked"], "navigators": n, "agents": res["agents"],
+                "merge_commit": res["merge_commit"]}
     rep, agents = orch._explore(site, policy, "chat-explore", n)
     stats = Curator(ctx.store, ctx.key, ctx.settings, ctx.embedder, ctx.llm).run_all(
         policy.max_risk_cost, escalate=make_curator_escalation(ctx.settings, ctx.store, ctx.key, ctx.embedder, ctx.llm))
@@ -107,8 +112,9 @@ def _make_demo(ctx: ToolContext, args: dict):
     else:
         if not args.get("request"):
             raise ValueError("give the request for the demo (or a reply to the demo agent's question)")
+        git = GitOps(ctx.store, ctx.settings.uid, ctx.domain, ctx.settings) if ctx.settings.use_git else None
         agent = DemoAgent(ctx.settings, ctx.store, ctx.embedder, ctx.llm, ctx.blobs, ctx.key, ctx.domain, ctx.device,
-                          ctx.profile, policy_of(ctx))
+                          ctx.profile, policy_of(ctx), git=git)
         ctx.extra["demo_agent"] = agent
         res = agent.run(args["request"])
     if res.status == "needs_input":
@@ -135,7 +141,7 @@ def _profile(ctx: ToolContext):
 
 def _remember(ctx: ToolContext, args: dict):
     text = args["text"].strip()
-    if _SENSITIVE_MEMORY.search(text):
+    if SENSITIVE_TEXT.search(text):
         raise ValueError("refused: memories must not contain passwords, keys, emails, card or long numbers or other "
                          "personal data. Save only preferences or notes about a site.")
     gid = _profile(ctx).remember(text, kind=args.get("kind", "semantic"), importance=0.5,

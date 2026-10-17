@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 
 from ..embed import cosine
-from ..llm import OfflineLLM, complete_json
+from ..llm import complete_json, has_model
 
 MAX_ITEMS = 200
 MAX_LLM_ITEMS = 60
@@ -58,7 +58,7 @@ def pick_by_meaning(texts: list[str], request: str, embedder, threshold: float, 
 
 def pick_by_llm(texts: list[str], request: str, llm) -> str | None:
     """Rule 3: show the list to the LLM and let it choose (only when a real LLM is configured)."""
-    if llm is None or isinstance(llm, OfflineLLM):
+    if not has_model(llm):
         return None
     uniq = list(dict.fromkeys(t for t in texts if t))[:MAX_LLM_ITEMS]
     if not uniq:

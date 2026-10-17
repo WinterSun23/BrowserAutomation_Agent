@@ -41,26 +41,41 @@ def rehash(store, key: str, blobs, settings, domain: str) -> dict:
     w = MapWriter(store, tmp, settings)
     state_map: dict[str, str] = {}
     el_map: dict[str, str] = {}
-    for sg, snap in store.ro_query(key, "MATCH (s:State) WHERE s.snapshot_ref IS NOT NULL RETURN s.gid, s.snapshot_ref"):
+    def replay(snap: str, old_elements) -> str:
         raw = RawSnapshot.from_dict(json.loads(gzip.decompress(blobs.read(snap))))
         obs = build_state(raw, domain, settings.template_min_items)
-        state_map[sg] = w.write_state(obs, snapshot_ref=snap)
+        new_sg = w.write_state(obs, snapshot_ref=snap)
         by_css = {e.css: e.gid for e in obs.elements()}
         by_item = {e.item_locator: e.gid for e in obs.elements() if e.is_template}
-        for eg, fp, item in store.ro_query(key, """MATCH (s:State {gid:$g})-[:COMPOSED_OF]->(:ComponentState)
-                                                   -[:CONTAINS]->(e:Element) RETURN e.gid, e.fingerprint, e.item_locator""",
-                                           {"g": sg}):
+        for eg, fp, item in old_elements:
             css = json.loads(fp or "{}").get("css")
             new = by_item.get(item) if item else by_css.get(css)
             if new:
                 el_map[eg] = new
+        return new_sg
+
+    for sg, snap in store.ro_query(key, "MATCH (s:State) WHERE s.snapshot_ref IS NOT NULL RETURN s.gid, s.snapshot_ref"):
+        state_map[sg] = replay(snap, store.ro_query(
+            key, """MATCH (s:State {gid:$g})-[:COMPOSED_OF]->(:ComponentState)-[:CONTAINS]->(e:Element)
+                    RETURN e.gid, e.fingerprint, e.item_locator""", {"g": sg}))
+    # Component states first seen after their state (a menu opened): their elements are only in their own snapshot.
+    for (snap,) in store.ro_query(key, "MATCH (c:ComponentState) WHERE c.snapshot_ref IS NOT NULL "
+                                       "RETURN DISTINCT c.snapshot_ref"):
+        replay(snap, store.ro_query(
+            key, """MATCH (c:ComponentState {snapshot_ref:$r})-[:CONTAINS]->(e:Element)
+                    RETURN e.gid, e.fingerprint, e.item_locator""", {"r": snap}))
+        for (cg,) in store.ro_query(key, "MATCH (c:ComponentState {snapshot_ref:$r}) RETURN c.gid", {"r": snap}):
+            store.query(tmp, "MATCH (c:ComponentState {gid:$g}) SET c.snapshot_ref = $r", {"g": cg, "r": snap})
     for sg, label in store.ro_query(key, "MATCH (s:State) RETURN s.gid, labels(s)"):
         if sg in state_map:
             for extra in ("Entry", "Blocking"):
                 if extra in label:
                     store.query(tmp, f"MATCH (s:State {{gid:$g}}) SET s:{extra}", {"g": state_map[sg]})
     action_map: dict[str, str] = {}
+    dropped_actions = 0
     for g, a, b, props in store.ro_query(key, "MATCH (a:State)-[r:ACTION]->(b:State) RETURN r.gid, a.gid, b.gid, properties(r)"):
+        if not (a in state_map and b in state_map and props.get("el_gid") in el_map):
+            dropped_actions += 1
         if a in state_map and b in state_map and props.get("el_gid") in el_map:
             ng = gid("ac", state_map[a], el_map[props["el_gid"]], props.get("action_type"), props.get("value_var") or "",
                      state_map[b])
@@ -101,4 +116,4 @@ def rehash(store, key: str, blobs, settings, domain: str) -> dict:
     store.copy(tmp, key)
     store.delete(tmp)
     return {"states": len(set(state_map.values())), "elements": len(el_map), "actions": len(action_map),
-            "dropped_transitions": dropped_transitions, "backup": tag}
+            "dropped_actions": dropped_actions, "dropped_transitions": dropped_transitions, "backup": tag}

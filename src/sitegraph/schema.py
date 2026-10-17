@@ -4,15 +4,17 @@ from .db import GraphStore
 
 _DEVICE_EXACT = ["State", "Page", "Component", "ComponentState", "Element", "Workflow", "WStep",
                  "Intent", "Feature", "Run", "Step", "Observation", "DemoRequest", "Storyboard", "Shot", "Render"]
-_DEVICE_REL = [("ACTION", "gid"), ("TRANSITION", "gid"), ("ACTION", "el_gid")]
+_DEVICE_REL = [("ACTION", "gid"), ("TRANSITION", "gid"), ("ACTION", "el_gid"), ("BROKEN_ACTION", "gid"),
+               ("BROKEN_TRANSITION", "gid")]
 _DEVICE_FULLTEXT = [("Element", "name_sample"), ("Page", "title")]
 _DEVICE_VECTOR = ["State", "Component", "Element", "Intent", "Workflow", "DemoRequest", "Feature"]
 _DEVICE_UNIQUE = ["State", "Page", "Component", "ComponentState", "Element", "Workflow", "Intent"]
 
 _OPS_EXACT = [("Agent", "id"), ("Task", "id"), ("Claim", "target_gid"), ("Branch", "name"), ("Commit", "id"),
-              ("WorkItem", "gid"), ("WorkItem", "scope")]
+              ("WorkItem", "gid"), ("WorkItem", "scope"), ("Change", "gid"), ("Tag", "name"), ("Note", "gid"),
+              ("Handoff", "gid"), ("Experiment", "gid"), ("Variant", "gid")]
 _PROFILE_EXACT = [("Preference", "key"), ("Memory", "gid"), ("Session", "id"), ("Request", "gid"),
-                  ("SiteEntry", "gid"), ("ExplorationPolicy", "name")]
+                  ("SiteEntry", "gid"), ("ExplorationPolicy", "name"), ("VaultRef", "var")]
 _PROFILE_VECTOR = ["Memory", "Request"]
 
 
@@ -73,11 +75,12 @@ def ensure_device_schema(store: GraphStore, key: str, dim: int = 384) -> None:
         _unique(store, key, label)
 
 
-def ensure_ops_schema(store: GraphStore, key: str) -> None:
+def ensure_ops_schema(store: GraphStore, key: str, dim: int = 384) -> None:
     store.query(key, "RETURN 1")
     have = _existing(store, key)
     for label, prop in _OPS_EXACT:
         _exact(store, key, have, label, prop)
+    _vector(store, key, have, "Note", dim)
 
 
 def ensure_profile_schema(store: GraphStore, key: str, dim: int = 384) -> None:

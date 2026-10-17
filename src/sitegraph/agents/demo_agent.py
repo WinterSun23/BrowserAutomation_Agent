@@ -7,7 +7,7 @@ from ..demo.director import DemoDirector, DemoResult
 from ..demo.spec import FORMATS, DemoSpec
 from ..demo.storyboard import ShotPlan, Storyboard, StoryboardBuilder
 from ..graph.queries import entry_state
-from ..llm import OfflineLLM
+from ..llm import can_call_tools
 from ..policy import ExplorationPolicy
 from ..tools import ToolContext, build_toolbox
 from ..tools import demo_tools
@@ -35,10 +35,12 @@ summary of what the demo shows and which files were made."""
 
 class DemoAgent:
     def __init__(self, settings, store, embedder, llm, blobs, key: str, domain: str, device: str = "desktop",
-                 profile=None, policy: ExplorationPolicy | None = None, chat_llm=None):
+                 profile=None, policy: ExplorationPolicy | None = None, chat_llm=None, git=None):
+        self.git = git                   # GitOps: the recording's map writes become a commit on main
+        self.writer = None
         self.settings, self.store, self.embedder, self.llm, self.blobs = settings, store, embedder, llm, blobs
         self.key, self.domain, self.device, self.profile = key, domain, device, profile
-        self.policy = policy or (profile.default_policy() if profile else ExplorationPolicy())
+        self.policy = policy or (profile.policy_for(self.domain, self.device) if profile else ExplorationPolicy())
         self.chat_llm = chat_llm or llm
         self.session: DemoSession | None = None
         self.shots: dict[int, ShotPlan] = {}
@@ -54,14 +56,14 @@ class DemoAgent:
 
     @property
     def can_use_agent(self) -> bool:
-        return hasattr(self.chat_llm, "chat") and not isinstance(self.chat_llm, OfflineLLM)
+        return can_call_tools(self.chat_llm)
 
     # ---------- entry points ----------
     def run(self, request: str, start_url: str | None = None) -> DemoResult:
         self.request = request
         if not self.can_use_agent:      # no tool-calling model: the fixed pipeline does the whole job
             director = DemoDirector(self.store, self.key, self.domain, self.settings, self.embedder, self.llm,
-                                    self.blobs, self.profile, self.device)
+                                    self.blobs, self.profile, self.device, git=self.git)
             return director.run(request, start_url)
         entry = entry_state(self.store, self.key)
         url = start_url or (entry[1] if entry else None)
@@ -79,11 +81,20 @@ class DemoAgent:
     def close(self) -> None:
         if self.session is not None and self.session.is_open:
             self.session.close()
+        self._commit_capture()
+
+    def _commit_capture(self) -> str | None:
+        """The map writes made while recording go into one commit on main (the single-writer rule)."""
+        if self.git is None or self.writer is None or not self.writer.changes:
+            return None
+        sb = self.storyboard.gid if self.storyboard else "(unfinished)"
+        return self.git.commit_main(self.device, self.writer, "demo-director", f"demo capture {sb}")
 
     # ---------- the agent loop ----------
     def _start(self, url: str) -> None:
+        self.writer = self.git.main_recorder(self.device) if self.git else None
         self.session = DemoSession(self.store, self.key, self.domain, self.settings, self.embedder, self.llm,
-                                   self.device)
+                                   self.device, writer=self.writer)
         self.session.open(url)
         self.ctx = ToolContext(settings=self.settings, store=self.store, key=self.key, domain=self.domain,
                                embedder=self.embedder, llm=self.llm, policy=self.policy, profile=self.profile,
@@ -210,7 +221,9 @@ class DemoAgent:
             segments=[recorded.shot_segments[s.i] for s in picked if s.i in recorded.shot_segments])
         self.spec.formats = list(formats)
         director = DemoDirector(self.store, self.key, self.domain, self.settings, self.embedder, self.llm, self.blobs,
-                                self.profile, self.device)
+                                self.profile, self.device, git=self.git)
+        self._commit_capture()
+        director.pin(self.storyboard)
         director._link_steps(self.storyboard, cap)
         renders = director.render_all(self.storyboard, cap, formats)
         self.final = DemoResult(self.storyboard.gid, renders, self.spec)

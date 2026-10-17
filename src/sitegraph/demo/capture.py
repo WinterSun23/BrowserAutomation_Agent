@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
 
+from ..agents.factory import make_navigator
 from ..agents.navigator import Navigator
 from ..browser.session import BrowserSession
 from ..graph.queries import load_element
@@ -31,9 +32,11 @@ class DemoSession:
     """A recording browser plus the bookkeeping of what was captured. Shots are recorded one at a time, so the same
     code serves the batch capturer (a prepared storyboard) and the Demo agent (shots chosen as it goes)."""
 
-    def __init__(self, store, key, domain, settings, embedder, llm, device: str = "desktop"):
+    def __init__(self, store, key, domain, settings, embedder, llm, device: str = "desktop", writer=None,
+                 secrets=None):
         self.store, self.key, self.domain, self.s = store, key, domain, settings
         self.embedder, self.llm, self.device = embedder, llm, device
+        self.writer, self.secrets = writer, secrets
         self.result = CaptureResult(video_path=None)
         self.sess: BrowserSession | None = None
         self.nav: Navigator | None = None
@@ -51,8 +54,8 @@ class DemoSession:
         self.sess.context.add_init_script(OVERLAY_JS)
         vp = self.sess.page.viewport_size or {"width": 1280, "height": 720}
         self.result.viewport = (vp["width"], vp["height"])
-        self.nav = Navigator(self.store, self.key, self.domain, self.sess, self.s, self.embedder, self.llm,
-                             agent_id="demo-director")
+        self.nav = make_navigator(self.store, self.key, self.domain, self.sess, self.s, self.embedder, self.llm,
+                                  agent_id="demo-director", writer=self.writer, secrets=self.secrets)
         self.sess.goto(start_url)
         self.run = self.nav.activity.start_run("demo-capture", "demo-director", request=start_url)
         self.result.run_gid = self.run
@@ -125,12 +128,15 @@ class DemoSession:
 class DemoCapturer:
     """Records a prepared storyboard shot by shot in one browser session."""
 
-    def __init__(self, store, key, domain, settings, embedder, llm, device: str = "desktop"):
+    def __init__(self, store, key, domain, settings, embedder, llm, device: str = "desktop", writer=None,
+                 secrets=None):
         self.store, self.key, self.domain, self.s = store, key, domain, settings
         self.embedder, self.llm, self.device = embedder, llm, device
+        self.writer, self.secrets = writer, secrets
 
     def capture(self, sb: Storyboard, start_url: str) -> CaptureResult:
-        session = DemoSession(self.store, self.key, self.domain, self.s, self.embedder, self.llm, self.device)
+        session = DemoSession(self.store, self.key, self.domain, self.s, self.embedder, self.llm, self.device,
+                              writer=self.writer, secrets=self.secrets)
         session.open(start_url)
         try:
             for shot in sb.shots:

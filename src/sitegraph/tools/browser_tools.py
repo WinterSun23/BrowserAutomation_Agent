@@ -20,12 +20,13 @@ def get_nav(ctx: ToolContext):
     nav = ctx.extra.get("nav")
     if nav is None:
         from ..agents.escalation import make_escalation
-        from ..agents.navigator import Navigator
+        from ..agents.factory import make_navigator
 
-        nav = Navigator(ctx.store, ctx.key, ctx.domain, ctx.browser(), ctx.settings, ctx.embedder, ctx.llm,
-                        ctx.blobs, None, agent_id="chat-agent", ops=ctx.ops,
-                        escalate=make_escalation(ctx.settings, ctx.store, ctx.key, ctx.domain, ctx.embedder, ctx.llm,
-                                                 ctx.blobs, ctx.device))
+        nav = make_navigator(ctx.store, ctx.key, ctx.domain, ctx.browser(), ctx.settings, ctx.embedder, ctx.llm,
+                             blobs=ctx.blobs, agent_id="chat-agent", ops=ctx.ops, writer=ctx.writer,
+                             secrets=(lambda var: ctx.profile.secret_for(var, ctx.domain)) if ctx.profile else None,
+                             escalate=make_escalation(ctx.settings, ctx.store, ctx.key, ctx.domain, ctx.embedder,
+                                                      ctx.llm, ctx.blobs, ctx.device))
         ctx.extra["nav"] = nav
     return nav
 
@@ -184,10 +185,20 @@ def fill(ctx: ToolContext, args: dict):
         raise ValueError(f"cannot type into a {el.role}")
     if (el.input_kind or "").lower() == "password":
         raise ValueError("refusing to type into a password field")
-    _resolve(ctx, nav, el, None).locator.fill(args["value"])
-    name = args.get("var_name") or var_name(el.name_norm, (el.fingerprint.get("attrs") or {}).get("name"))
+    secret_var = args.get("from_secret")
+    if secret_var:
+        # the vault value is typed without ever entering the model's context, the trace or the graph
+        value = ctx.profile.secret_for(secret_var, ctx.domain) if ctx.profile is not None else None
+        if value is None:
+            raise ValueError(f"no secret named '{secret_var}' for this site; ask the user to store it")
+    elif args.get("value") is not None:
+        value = args["value"]
+    else:
+        raise ValueError("pass either `value` (the user's own words) or `from_secret` (a stored secret's name)")
+    _resolve(ctx, nav, el, None).locator.fill(value)
+    name = args.get("var_name") or secret_var or var_name(el.name_norm, (el.fingerprint.get("attrs") or {}).get("name"))
     ctx.extra.setdefault("filled", {})[el.gid] = name          # only the variable NAME is remembered, never the value
-    ctx.extra.setdefault("typed", []).append(args["value"])    # in memory only: used to scrub it out of observations
+    ctx.extra.setdefault("typed", []).append(value)            # in memory only: used to scrub it out of observations
     return {"filled": el.name_sample[:60], "variable": name}
 
 
@@ -248,8 +259,10 @@ def register(box: Toolbox) -> None:
         _el_schema(item={"type": "string"}), hover, "act", untrusted_output=True))
     box.register(ToolSpec(
         "fill", "Type a value into a text or search box. Never use for passwords. Pass the user's own words as "
-        "`value`; it is typed but never stored. Optionally name the variable (var_name), e.g. 'query'.",
-        _el_schema(value={"type": "string"}, var_name={"type": "string"}) | {"required": ["element_id", "value"]},
+        "`value`; it is typed but never stored. To type a stored secret (see list_secrets) pass `from_secret` instead: "
+        "you never see its value. Optionally name the variable (var_name), e.g. 'query'.",
+        _el_schema(value={"type": "string"}, from_secret={"type": "string"}, var_name={"type": "string"})
+        | {"required": ["element_id"]},
         fill, "act", sensitive_args=("value",)))
     box.register(ToolSpec(
         "scroll", "Scroll the page.", {"type": "object", "properties": {"direction": {

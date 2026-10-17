@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import json
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from ..graph.queries import entry_state
+from ..graph.recording import copy_activity
 from ..ids import now_ms, ulid
 from .capture import CaptureResult, DemoCapturer
 from .render import (render_clickthrough_html, render_gif, render_guide_html, render_video,
                      render_video_segments)
 from .spec import DemoSpec, interpret
-from .storyboard import Storyboard, StoryboardBuilder
+from .storyboard import Storyboard, StoryboardBuilder, load_storyboard
 
 
 @dataclass
@@ -23,21 +25,68 @@ class DemoResult:
 
 
 class DemoDirector:
-    def __init__(self, store, key, domain, settings, embedder, llm, blobs, profile=None, device: str = "desktop"):
+    def __init__(self, store, key, domain, settings, embedder, llm, blobs, profile=None, device: str = "desktop",
+                 git=None):
         self.store, self.key, self.domain, self.s = store, key, domain, settings
         self.embedder, self.llm, self.blobs, self.profile, self.device = embedder, llm, blobs, profile, device
+        self.git = git                       # GitOps: demo captures are committed and storyboards pinned to the map
 
     def run(self, text: str, start_url: str | None = None) -> DemoResult:
         prefs = self.profile.get_prefs() if self.profile else {}
-        spec = interpret(self.llm, text, prefs)
-        sb = StoryboardBuilder(self.store, self.key, self.embedder, self.llm).build(spec, text)
+        memories = [t for t, sc in self.profile.recall(text, 3) if sc >= 0.5] if self.profile else None
+        spec = interpret(self.llm, text, prefs, memories)
+        sb = StoryboardBuilder(self.store, self.key, self.embedder, self.llm).build(
+            spec, text, map_commit=self.git.head(self.device) if self.git else None)
         if start_url is None:
             entry = entry_state(self.store, self.key)
             start_url = entry[1] if entry else None
-        cap = DemoCapturer(self.store, self.key, self.domain, self.s, self.embedder, self.llm,
-                           self.device).capture(sb, start_url)
+        cap = self._capture(self.key, sb, start_url)
         self._link_steps(sb, cap)
         return DemoResult(sb.gid, self.render_all(sb, cap, spec.formats), spec)
+
+    def _capture(self, key: str, sb: Storyboard, start_url: str) -> CaptureResult:
+        """Record the storyboard. On the live map, the capture's map writes go through git (a commit on main) and the
+        storyboard is pinned to the resulting version; a throwaway checkout needs neither."""
+        live = self.git is not None and key == self.key
+        writer = self.git.main_recorder(self.device) if live else None
+        cap = DemoCapturer(self.store, key, self.domain, self.s, self.embedder, self.llm, self.device,
+                           writer=writer).capture(sb, start_url)
+        if live:
+            self.git.commit_main(self.device, writer, "demo-director", f"demo capture {sb.gid}")
+            self.pin(sb)
+        return cap
+
+    def pin(self, sb: Storyboard) -> None:
+        """Record which version of the map this storyboard was made against."""
+        if self.git is None:
+            return
+        sb.map_commit = self.git.head(self.device)
+        self.store.query(self.key, "MATCH (s:Storyboard {gid:$g}) SET s.map_commit = $c", {"g": sb.gid, "c": sb.map_commit})
+
+    def rerender(self, sb_gid: str, pinned: bool = False) -> DemoResult:
+        """Record and render a saved storyboard again. `pinned`: against the map as it was when the demo was made
+        (a throwaway checkout of its commit); otherwise against the map as it is now."""
+        sb = load_storyboard(self.store, self.key, sb_gid)
+        spec_json = self.store.ro_query(self.key, "MATCH (r:DemoRequest)-[:PRODUCED]->(:Storyboard {gid:$g}) "
+                                                  "RETURN r.interpretation", {"g": sb_gid})[0][0]
+        spec = DemoSpec(**json.loads(spec_json))
+        if not spec.formats:         # a storyboard the Demo agent composed stores no formats: reuse what it rendered
+            spec.formats = [f for (f,) in self.store.ro_query(
+                self.key, "MATCH (:Storyboard {gid:$g})-[:RENDERED_AS]->(r:Render {status:'ok'}) "
+                          "RETURN DISTINCT r.format", {"g": sb_gid})] or ["video"]
+        key = self.git.checkout(self.device, sb.map_commit) if (pinned and self.git and sb.map_commit) else self.key
+        entry = entry_state(self.store, key)
+        if entry is None:
+            raise ValueError("there is no entry screen to start the re-recording from")
+        cap = self._capture(key, sb, entry[1])
+        if key != self.key:
+            copy_activity(self.store, key, self.key)
+            self.store.delete(key)
+        self._link_steps(sb, cap)
+        renders = self.render_all(sb, cap, spec.formats)
+        self.store.query(self.key, "MATCH (s:Storyboard {gid:$g}) SET s.version = s.version + 1, s.status = 'ok'",
+                         {"g": sb_gid})
+        return DemoResult(sb_gid, renders, spec)
 
     def render_all(self, sb: Storyboard, cap: CaptureResult, formats: list[str]) -> list[tuple[str, str]]:
         """Render every format, recording a Render node (ok or failed) for each."""

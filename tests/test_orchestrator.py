@@ -40,7 +40,7 @@ def test_explore_then_automate_end_to_end(store, settings, site_url):
     r1 = o.run_task(t1, "explore the site", site)
     assert r1["kind"] == "explore" and r1["states"] >= 5 and ops.get_task(t1)["status"] == "done"
     assert r1["navigators"] == settings.navigators_per_site == 2     # default: two agents on the one site graph
-    assert r1["agents"] == ["navigator-desktop-1", "navigator-desktop-2"]
+    assert r1["agents"] == ["explorer-desktop-0", "explorer-desktop-1"]
     t2 = ops.create_task("chat", "take me to the cart")
     r2 = o.run_task(t2, "take me to the cart", site)
     assert r2["kind"] == "automate" and r2["status"] == "done"

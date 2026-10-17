@@ -11,6 +11,7 @@ REL_CATALOG = {
     "ACTION": "routes (algo.SPpaths), next actions, BFS frontier, PageRank/betweenness/CDLP",
     "TRANSITION": "pre_cstates satisfaction; micro demo shots",
     "BROKEN_ACTION": "quarantined actions (excluded from algorithms); repair",
+    "BROKEN_TRANSITION": "quarantined component transitions (excluded from pre_cstates); repair",
     "FULFILLED_BY": "intent resolution",
     "STEP_OF": "workflow membership; demo score; impact",
     "FROM": "step anchors (WStep, Step)",
@@ -27,4 +28,13 @@ REL_CATALOG = {
     "SHOWS": "shot -> state (impact, re-render)",
     "FROM_STEP": "shot provenance; retention protection",
     "RENDERED_AS": "storyboard -> render files",
+}
+
+
+OPS_REL_CATALOG = {
+    "ASSIGNED_TO": "task -> agent", "SUBTASK_OF": "device fan-out", "DEPENDS_ON": "runnable tasks",
+    "HELD_BY": "claims / merge lock", "FROM_AGENT": "handoff", "TO_AGENT": "handoff", "FOR_TASK": "handoff / branch",
+    "BY": "note author", "OWNED_BY": "branch owner", "HEAD": "branch head", "PARENT": "commit DAG",
+    "AUTHORED_BY": "commit author", "HAS_CHANGE": "change log", "AT": "tag -> commit", "IN_MERGE": "conflicts",
+    "VARIANT": "experiment variants", "BASED_ON": "variant -> tag",
 }

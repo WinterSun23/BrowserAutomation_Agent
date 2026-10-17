@@ -161,3 +161,19 @@ def test_make_curator_escalation_needs_a_tool_calling_llm():
     assert make_curator_escalation(Settings(), None, "k", HashEmbedder(), FakeLLM(lambda s, u: "")) is None
     assert make_curator_escalation(Settings(escalate_curator=False), None, "k", HashEmbedder(), ScriptedLLM([])) is None
     assert isinstance(make_curator_escalation(Settings(), None, "k", HashEmbedder(), ScriptedLLM([])), CuratorEscalation)
+
+
+def test_curator_tool_edits_are_recorded_by_the_context_writer(seeded):
+    from sitegraph.graph.recording import RecordingMapWriter
+
+    store, key, settings = seeded
+    cur = _curator(seeded)
+    box = _tools(seeded, cur)
+    box.ctx.writer = RecordingMapWriter(store, key, settings)
+    assert box.call("merge_states", {"keep": "st:a", "merge": "st:b", "reason": "same page"}).ok
+    assert box.call("quarantine_edge", {"action_gid": "ac:bad", "reason": "keeps failing"}).ok
+    assert box.call("rename_state", {"state_gid": "st:a", "summary": "A product screen", "reason": "clearer"}).ok
+    assert box.call("restore_edge", {"action_gid": "ac:bad", "reason": "was fine"}).ok
+    assert [c.op for c in box.ctx.writer.changes] == ["merge_states", "quarantine", "rename_state", "unquarantine"]
+    assert store.ro_query(key, "MATCH (s:State {gid:'st:b'}) RETURN count(s)") == [[0]]
+    assert store.ro_query(key, "MATCH (s:State {gid:'st:a'}) RETURN s.summary") == [["A product screen"]]

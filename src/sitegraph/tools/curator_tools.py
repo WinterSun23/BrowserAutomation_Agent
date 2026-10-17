@@ -11,10 +11,10 @@ from itertools import combinations
 
 from ..capture.segment import jaccard
 from ..graph.activity import ActivityLog
-from ..ids import gid, now_ms
+from ..graph.map_writer import MapWriter
+from ..ids import now_ms
 from .core import ToolContext, ToolSpec, Toolbox
 
-_REPOINT_IN = ["FROM", "TO", "SHOWS", "FULFILLED_BY"]   # (x)-[r]->(State) relationships that follow a merged state
 _DROP_PROPS = {"emb"}                                    # not worth keeping in a log
 
 
@@ -74,38 +74,9 @@ def state_edges(ctx: ToolContext, args: dict):
     return [dict(kind=r[0], gid=r[1], label=r[2], seen=r[3], successes=r[4], reliability=r[5], to=r[6]) for r in rows]
 
 
-def _move_action_edges(ctx: ToolContext, keep: str, merge: str) -> int:
-    """Re-create every ACTION edge of `merge` on `keep` (summing counters into an equivalent edge), delete the old."""
-    moved = 0
-    lam = ctx.settings.cost_lambda
-    for direction in ("out", "in"):
-        q = ("MATCH (b:State {gid:$m})-[r:ACTION]->(o:State) RETURN r, o.gid" if direction == "out"
-             else "MATCH (o:State)-[r:ACTION]->(b:State {gid:$m}) RETURN r, o.gid")
-        for edge, other in ctx.store.ro_query(ctx.key, q, {"m": merge}):
-            props = dict(edge.properties)
-            other = keep if other == merge else other
-            src, dst = (keep, other) if direction == "out" else (other, keep)
-            old_gid = props["gid"]
-            if src != dst:
-                new_gid = gid("ac", src, props.get("el_gid"), props.get("action_type"), props.get("value_var") or "", dst)
-                same = ctx.store.ro_query(ctx.key, "MATCH ()-[x:ACTION {gid:$g}]->() RETURN x", {"g": new_gid})
-                if same:
-                    other_props = dict(same[0][0].properties)
-                    ctx.store.query(ctx.key, """MATCH ()-[x:ACTION {gid:$g}]->()
-                        SET x.seen_count = $seen, x.success_count = $succ, x.first_seen = $fs, x.last_seen = $ls
-                        WITH x SET x.reliability = toFloat(x.success_count + 1) / (x.seen_count + 2)
-                        WITH x SET x.cost = 1.0 + $lam * (0.0 - log(x.reliability))""",
-                                    {"g": new_gid, "lam": lam,
-                                     "seen": other_props.get("seen_count", 0) + props.get("seen_count", 0),
-                                     "succ": other_props.get("success_count", 0) + props.get("success_count", 0),
-                                     "fs": min(other_props.get("first_seen", 0), props.get("first_seen", 0)),
-                                     "ls": max(other_props.get("last_seen", 0), props.get("last_seen", 0))})
-                else:
-                    ctx.store.query(ctx.key, "MATCH (a:State {gid:$s}), (b:State {gid:$d}) CREATE (a)-[x:ACTION]->(b) "
-                                             "SET x += $p, x.gid = $g", {"s": src, "d": dst, "p": props, "g": new_gid})
-                moved += 1
-            ctx.store.query(ctx.key, "MATCH ()-[x:ACTION {gid:$g}]->() DELETE x", {"g": old_gid})
-    return moved
+def _writer(ctx: ToolContext):
+    """The context's (possibly recording) writer, so every edit is a replayable, revertible operation."""
+    return ctx.writer or MapWriter(ctx.store, ctx.key, ctx.settings)
 
 
 def merge_states(ctx: ToolContext, args: dict):
@@ -113,36 +84,10 @@ def merge_states(ctx: ToolContext, args: dict):
     if keep == merge:
         raise ValueError("keep and merge must be different states")
     _budget(ctx)
-    rows = ctx.store.ro_query(ctx.key, """
-        MATCH (p1:Page)-[:HAS_STATE]->(a:State {gid:$k}), (p2:Page)-[:HAS_STATE]->(b:State {gid:$m})
-        RETURN p1.gid, p2.gid, a, b, labels(b)""", {"k": keep, "m": merge})
-    if not rows:
-        raise ValueError("unknown state gid")
-    page_a, page_b, a, b, b_labels = rows[0]
-    pa, pb = dict(a.properties), dict(b.properties)
-    if page_a != page_b:
-        raise ValueError("states of different pages are different screens and cannot be merged")
-    if (pa.get("blocking_sig") or "") != (pb.get("blocking_sig") or ""):
-        raise ValueError("one state has a modal dialog open and the other not: they are different screens")
-    moved = _move_action_edges(ctx, keep, merge)
-    for rel in _REPOINT_IN:
-        extra = " SET n.score = coalesce(n.score, r.score)" if rel == "FULFILLED_BY" else ""
-        ctx.store.query(ctx.key, f"MATCH (x)-[r:{rel}]->(m:State {{gid:$m}}), (k:State {{gid:$k}}) "
-                                 f"MERGE (x)-[n:{rel}]->(k){extra} DELETE r", {"m": merge, "k": keep})
-    aliases = list(dict.fromkeys(list(pa.get("aliases") or []) + [merge] + list(pb.get("aliases") or [])))
-    tokens = sorted(set(pa.get("tokens") or []) | set(pb.get("tokens") or []))
-    ctx.store.query(ctx.key, """MATCH (k:State {gid:$k}) SET k.aliases = $al, k.tokens = $tok, k.seen_count = $sc,
-                                k.first_seen = $fs, k.last_seen = $ls""",
-                    {"k": keep, "al": aliases, "tok": tokens,
-                     "sc": (pa.get("seen_count") or 0) + (pb.get("seen_count") or 0),
-                     "fs": min(pa.get("first_seen") or now_ms(), pb.get("first_seen") or now_ms()),
-                     "ls": max(pa.get("last_seen") or 0, pb.get("last_seen") or 0)})
-    if "Entry" in b_labels:
-        ctx.store.query(ctx.key, "MATCH (k:State {gid:$k}) SET k:Entry", {"k": keep})
-    ctx.store.query(ctx.key, "MATCH (b:State {gid:$m}) DETACH DELETE b", {"m": merge})
-    _log(ctx, "merge_states", keep, reason, merged=merge, edges_moved=moved,
-         merged_state=json.loads(json.dumps(_props(b), default=str)))
-    return {"kept": keep, "merged": merge, "actions_moved": moved, "aliases": len(aliases)}
+    out = _writer(ctx).merge_states(keep, merge)
+    _log(ctx, "merge_states", keep, reason, merged=merge, edges_moved=out["actions_moved"],
+         merged_state=json.loads(json.dumps(out["merged_state"], default=str)))
+    return {"kept": keep, "merged": merge, "actions_moved": out["actions_moved"], "aliases": out["aliases"]}
 
 
 def rename_state(ctx: ToolContext, args: dict):
@@ -153,37 +98,33 @@ def rename_state(ctx: ToolContext, args: dict):
     if not rows:
         raise ValueError(f"unknown state {args['state_gid']}")
     old, titles = rows[0]
-    ctx.extra["curator"]._store_state(args["state_gid"], args["summary"][:300], [], titles)
-    _log(ctx, "rename_state", args["state_gid"], args["reason"], old_summary=old, new_summary=args["summary"][:300])
-    return {"state": args["state_gid"], "summary": args["summary"][:300]}
+    summary = args["summary"][:300]
+    titles, state_vec, intents = ctx.extra["curator"].state_embeddings(summary, [], titles)
+    _writer(ctx).rename_state(args["state_gid"], summary, titles, state_vec, intents)
+    _log(ctx, "rename_state", args["state_gid"], args["reason"], old_summary=old, new_summary=summary)
+    return {"state": args["state_gid"], "summary": summary}
 
 
 def quarantine_edge(ctx: ToolContext, args: dict):
     _budget(ctx)
-    rows = ctx.store.ro_query(ctx.key, "MATCH (a:State)-[r:ACTION {gid:$g}]->(b:State) RETURN r, a.gid, b.gid",
+    rows = ctx.store.ro_query(ctx.key, "MATCH (a:State)-[r:ACTION {gid:$g}]->(b:State) RETURN a.gid, b.gid",
                               {"g": args["action_gid"]})
     if not rows:
         raise ValueError(f"unknown action {args['action_gid']} (it may already be quarantined)")
-    edge, src, dst = rows[0]
-    props = {**dict(edge.properties), "broken_since": now_ms(), "reason": args["reason"][:300]}
-    ctx.store.query(ctx.key, "MATCH (a:State {gid:$s}), (b:State {gid:$d}) CREATE (a)-[n:BROKEN_ACTION]->(b) SET n += $p",
-                    {"s": src, "d": dst, "p": props})
-    ctx.store.query(ctx.key, "MATCH ()-[r:ACTION {gid:$g}]->() DELETE r", {"g": args["action_gid"]})
+    src, dst = rows[0]
+    _writer(ctx).quarantine("ACTION", args["action_gid"], args["reason"][:300])
     _log(ctx, "quarantine_edge", src, args["reason"], action=args["action_gid"], to=dst)
     return {"quarantined": args["action_gid"], "note": "route planning now ignores it; restore_edge undoes this"}
 
 
 def restore_edge(ctx: ToolContext, args: dict):
     _budget(ctx)
-    rows = ctx.store.ro_query(ctx.key, "MATCH (a:State)-[r:BROKEN_ACTION {gid:$g}]->(b:State) RETURN r, a.gid, b.gid",
+    rows = ctx.store.ro_query(ctx.key, "MATCH (a:State)-[r:BROKEN_ACTION {gid:$g}]->(b:State) RETURN a.gid, b.gid",
                               {"g": args["action_gid"]})
     if not rows:
         raise ValueError(f"no quarantined action {args['action_gid']}")
-    edge, src, dst = rows[0]
-    props = {k: v for k, v in dict(edge.properties).items() if k not in ("broken_since", "reason")}
-    ctx.store.query(ctx.key, "MATCH (a:State {gid:$s}), (b:State {gid:$d}) CREATE (a)-[n:ACTION]->(b) SET n += $p",
-                    {"s": src, "d": dst, "p": props})
-    ctx.store.query(ctx.key, "MATCH ()-[r:BROKEN_ACTION {gid:$g}]->() DELETE r", {"g": args["action_gid"]})
+    src, dst = rows[0]
+    _writer(ctx).unquarantine("ACTION", args["action_gid"])
     _log(ctx, "restore_edge", src, args["reason"], action=args["action_gid"], to=dst)
     return {"restored": args["action_gid"]}
 

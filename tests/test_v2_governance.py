@@ -73,6 +73,7 @@ def test_rehash_is_lossless_when_algorithm_unchanged(store, built, msettings):
     report = rehash(store, key, blobs, msettings, domain)
     after = store.ro_query(key, "MATCH (s:State) WITH count(s) AS s MATCH ()-[a:ACTION]->() RETURN s, count(a)")[0]
     assert after == before and report["states"] == before[0]
+    assert report["dropped_actions"] == 0 and report["dropped_transitions"] == 0
     assert load_workflow_steps(store, key, wf)
     entry = entry_state(store, key)
     cart = store.ro_query(key, "MATCH (:Page {url_template:'/cart.html'})-[:HAS_STATE]->(s:State) RETURN s.gid LIMIT 1")[0][0]

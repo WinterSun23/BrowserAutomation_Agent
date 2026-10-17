@@ -7,6 +7,7 @@ from ..capture.segment import jaccard
 from ..config import Settings
 from ..db import GraphStore
 from ..ids import gid, now_ms
+from ..normalize import normalize_text
 from ..versions import ALGO_VERSION, SCHEMA_VERSION
 
 _COST = """WITH r
@@ -98,6 +99,16 @@ SET s.untried_count = n
 RETURN n"""
 
 
+_ENDPOINT = {"ACTION": "State", "BROKEN_ACTION": "State", "TRANSITION": "ComponentState",
+             "BROKEN_TRANSITION": "ComponentState"}
+_BROKEN = {"ACTION": "BROKEN_ACTION", "TRANSITION": "BROKEN_TRANSITION"}
+_REPOINT_IN = ["FROM", "TO", "SHOWS", "FULFILLED_BY"]   # (x)-[r]->(State) relationships that follow a merged state
+
+
+def _clean(p: dict | None) -> dict:
+    return {k: v for k, v in (p or {}).items() if v is not None and k != "emb"}
+
+
 class MapWriter:
     def __init__(self, store: GraphStore, key: str, settings: Settings, now=now_ms):
         self.store, self.key, self.s, self.now = store, key, settings, now
@@ -177,9 +188,14 @@ class MapWriter:
         self.q("MATCH (c:ComponentState {gid:$g}) WHERE c.screenshot_ref IS NULL SET c.screenshot_ref = $r",
                g=cs_gid, r=ref)
 
+    def set_cstate_snapshot(self, cs_gid: str, ref: str) -> None:
+        """Raw snapshot in which a component state was first seen, so a re-hash can rebuild it later."""
+        self.q("MATCH (c:ComponentState {gid:$g}) WHERE c.snapshot_ref IS NULL SET c.snapshot_ref = $r",
+               g=cs_gid, r=ref)
+
     def write_action(self, src: str, dst: str, el: dict, action_type: str = "click", value_var: str | None = None,
                      pre_cstates=(), requires_inputs=(), success: bool = True) -> str:
-        g = gid("ac", src, el["gid"], action_type, value_var or "", dst)
+        g = self.action_gid(src, el["gid"], action_type, value_var, dst)
         label = f"{action_type} '{(el.get('name_sample') or el.get('name_norm') or '')[:40]}'"
         self.q(_ACTION, src=src, dst=dst, g=g, el=el["gid"], type=action_type, var=value_var, label=label,
                risk=el.get("risk", "submit_safe"), rc=int(el.get("risk_cost", 1)), pre=list(pre_cstates),
@@ -203,7 +219,7 @@ class MapWriter:
 
     def write_transition(self, comp_gid: str, src_cs: str, dst_cs: str, el: dict, action_type: str = "click",
                          src_name: str = "absent", dst_name: str = "open") -> str:
-        g = gid("tr", src_cs, el["gid"], action_type, dst_cs)
+        g = self.transition_gid(src_cs, el["gid"], action_type, dst_cs)
         label = f"{action_type} '{(el.get('name_sample') or '')[:40]}'"
         self.q(_TRANSITION, comp=comp_gid, src=src_cs, dst=dst_cs, src_name=src_name, dst_name=dst_name, g=g,
                el=el["gid"], type=action_type, label=label, rc=int(el.get("risk_cost", 1)), now=self.now())
@@ -235,3 +251,167 @@ class MapWriter:
         self.q("MATCH (x:Element {gid:$g}) SET x.locators = $l, x.locator_hits = $h, "
                "x.heal_count = coalesce(x.heal_count, 0) + $healed",
                g=el_gid, l=locs, h=json.dumps(hits, sort_keys=True), healed=1 if healed else 0)
+
+    # ---------- generic, recordable primitives (used by merge, revert, repair) ----------
+    @staticmethod
+    def action_gid(src, el_gid, action_type, value_var, dst) -> str:
+        return gid("ac", src, el_gid, action_type, value_var or "", dst)
+
+    @staticmethod
+    def transition_gid(src_cs, el_gid, action_type, dst_cs) -> str:
+        return gid("tr", src_cs, el_gid, action_type, dst_cs)
+
+    def node_props(self, label: str, gids) -> dict:
+        gids = list(gids)
+        if not gids:
+            return {}
+        found = {g: _clean(p) for g, p in self.ro(f"MATCH (n:{label}) WHERE n.gid IN $g RETURN n.gid, properties(n)",
+                                                  g=gids)}
+        return {g: found.get(g) for g in gids}
+
+    def edge_props(self, rtype: str, edge_gid: str) -> dict | None:
+        rows = self.ro(f"MATCH (a)-[r:{rtype} {{gid:$g}}]->(b) RETURN properties(r), a.gid, b.gid", g=edge_gid)
+        return {"props": _clean(rows[0][0]), "src": rows[0][1], "dst": rows[0][2]} if rows else None
+
+    def restore_node(self, label: str, node_gid: str, props: dict) -> None:
+        self.q(f"MERGE (n:{label} {{gid:$g}}) WITH n, n.emb AS e SET n = $p SET n.emb = e",
+               g=node_gid, p={**_clean(props), "gid": node_gid})
+
+    def delete_node(self, label: str, node_gid: str) -> None:
+        self.q(f"MATCH (n:{label} {{gid:$g}}) DETACH DELETE n", g=node_gid)
+
+    def restore_rel(self, label: str, node_gid: str, direction: str, rtype: str, other_label: str, other_gid: str,
+                    props: dict) -> None:
+        pattern = f"(n)-[r:{rtype}]->(m)" if direction == "out" else f"(n)<-[r:{rtype}]-(m)"
+        self.q(f"MATCH (n:{label} {{gid:$a}}), (m:{other_label} {{gid:$b}}) MERGE {pattern} SET r += $p",
+               a=node_gid, b=other_gid, p=_clean(props))
+
+    def restore_edge(self, rtype: str, edge_gid: str, src: str, dst: str, props: dict) -> None:
+        lab = _ENDPOINT[rtype]
+        self.q(f"MATCH (a:{lab} {{gid:$s}}), (b:{lab} {{gid:$d}}) MERGE (a)-[r:{rtype} {{gid:$g}}]->(b) SET r = $p",
+               s=src, d=dst, g=edge_gid, p={**_clean(props), "gid": edge_gid})
+
+    def delete_edge(self, rtype: str, edge_gid: str) -> None:
+        self.q(f"MATCH ()-[r:{rtype} {{gid:$g}}]->() DELETE r", g=edge_gid)
+
+    def set_props(self, label: str, node_gid: str, props: dict) -> None:
+        self.q(f"MATCH (n:{label} {{gid:$g}}) SET n += $p", g=node_gid, p=_clean(props))
+
+    def quarantine(self, rtype: str, edge_gid: str, reason: str, superseded_by: str | None = None) -> bool:
+        e = self.edge_props(rtype, edge_gid)
+        if e is None:
+            return False
+        self.delete_edge(rtype, edge_gid)
+        props = {**e["props"], "broken_since": self.now(), "reason": reason}
+        if superseded_by:
+            props["superseded_by"] = superseded_by
+        self.restore_edge(_BROKEN[rtype], edge_gid, e["src"], e["dst"], props)
+        return True
+
+    def unquarantine(self, rtype: str, edge_gid: str) -> bool:
+        e = self.edge_props(_BROKEN[rtype], edge_gid)
+        if e is None:
+            return False
+        self.delete_edge(_BROKEN[rtype], edge_gid)
+        props = {k: v for k, v in e["props"].items() if k not in ("broken_since", "reason", "superseded_by")}
+        self.restore_edge(rtype, edge_gid, e["src"], e["dst"], props)
+        return True
+
+    # ---------- curator edits (the Curator review agent's merge / rename) ----------
+    def action_edges_of(self, state_gid: str) -> list[dict]:
+        """Every ACTION edge touching a state: {gid, src, dst, props}."""
+        out = []
+        for direction, q in (
+                ("out", "MATCH (b:State {gid:$m})-[r:ACTION]->(o:State) RETURN r.gid, properties(r), b.gid, o.gid"),
+                ("in", "MATCH (o:State)-[r:ACTION]->(b:State {gid:$m}) RETURN r.gid, properties(r), o.gid, b.gid")):
+            for g, props, src, dst in self.ro(q, m=state_gid):
+                if direction == "in" and src == dst:
+                    continue                                        # a self-loop was already listed as "out"
+                out.append({"gid": g, "src": src, "dst": dst, "props": props})
+        return out
+
+    def merge_target_gid(self, edge: dict, keep: str, merge: str) -> str | None:
+        """The gid an edge of `merge` gets once re-created on `keep` (None when it would become a self-loop)."""
+        src = keep if edge["src"] == merge else edge["src"]
+        dst = keep if edge["dst"] == merge else edge["dst"]
+        if src == dst:
+            return None
+        p = edge["props"]
+        return self.action_gid(src, p.get("el_gid"), p.get("action_type"), p.get("value_var"), dst)
+
+    def _move_action_edges(self, keep: str, merge: str) -> int:
+        moved, lam = 0, self.s.cost_lambda
+        for edge in self.action_edges_of(merge):
+            new_gid = self.merge_target_gid(edge, keep, merge)
+            props = edge["props"]
+            if new_gid is not None:
+                src = keep if edge["src"] == merge else edge["src"]
+                dst = keep if edge["dst"] == merge else edge["dst"]
+                same = self.ro("MATCH ()-[x:ACTION {gid:$g}]->() RETURN properties(x)", g=new_gid)
+                if same:
+                    o = same[0][0]
+                    self.q("""MATCH ()-[x:ACTION {gid:$g}]->()
+                              SET x.seen_count = $seen, x.success_count = $succ, x.first_seen = $fs, x.last_seen = $ls
+                              WITH x SET x.reliability = toFloat(x.success_count + 1) / (x.seen_count + 2)
+                              WITH x SET x.cost = 1.0 + $lam * (0.0 - log(x.reliability))""",
+                           g=new_gid, lam=lam, seen=o.get("seen_count", 0) + props.get("seen_count", 0),
+                           succ=o.get("success_count", 0) + props.get("success_count", 0),
+                           fs=min(o.get("first_seen", 0), props.get("first_seen", 0)),
+                           ls=max(o.get("last_seen", 0), props.get("last_seen", 0)))
+                else:
+                    self.q("MATCH (a:State {gid:$s}), (b:State {gid:$d}) CREATE (a)-[x:ACTION]->(b) "
+                           "SET x += $p, x.gid = $g", s=src, d=dst, p=props, g=new_gid)
+                moved += 1
+            self.q("MATCH ()-[x:ACTION {gid:$g}]->() DELETE x", g=edge["gid"])
+        return moved
+
+    def merge_states(self, keep: str, merge: str) -> dict:
+        """Fold state `merge` into `keep` (same page, same modal state): actions move with summed counters, references
+        are re-pointed, aliases / tokens / counts / the Entry label are folded in, then `merge` is deleted."""
+        if keep == merge:
+            raise ValueError("keep and merge must be different states")
+        rows = self.ro("""MATCH (p1:Page)-[:HAS_STATE]->(a:State {gid:$k}), (p2:Page)-[:HAS_STATE]->(b:State {gid:$m})
+                          RETURN p1.gid, p2.gid, properties(a), properties(b), labels(b)""", k=keep, m=merge)
+        if not rows:
+            raise ValueError("unknown state gid")
+        page_a, page_b, pa, pb, b_labels = rows[0]
+        if page_a != page_b:
+            raise ValueError("states of different pages are different screens and cannot be merged")
+        if (pa.get("blocking_sig") or "") != (pb.get("blocking_sig") or ""):
+            raise ValueError("one state has a modal dialog open and the other not: they are different screens")
+        moved = self._move_action_edges(keep, merge)
+        for rel in _REPOINT_IN:
+            extra = " SET n.score = coalesce(n.score, r.score)" if rel == "FULFILLED_BY" else ""
+            self.q(f"MATCH (x)-[r:{rel}]->(m:State {{gid:$m}}), (k:State {{gid:$k}}) "
+                   f"MERGE (x)-[n:{rel}]->(k){extra} DELETE r", m=merge, k=keep)
+        aliases = list(dict.fromkeys(list(pa.get("aliases") or []) + [merge] + list(pb.get("aliases") or [])))
+        tokens = sorted(set(pa.get("tokens") or []) | set(pb.get("tokens") or []))
+        self.q("""MATCH (k:State {gid:$k}) SET k.aliases = $al, k.tokens = $tok, k.seen_count = $sc,
+                  k.first_seen = $fs, k.last_seen = $ls""", k=keep, al=aliases, tok=tokens,
+               sc=(pa.get("seen_count") or 0) + (pb.get("seen_count") or 0),
+               fs=min(pa.get("first_seen") or self.now(), pb.get("first_seen") or self.now()),
+               ls=max(pa.get("last_seen") or 0, pb.get("last_seen") or 0))
+        if "Entry" in b_labels:
+            self.q("MATCH (k:State {gid:$k}) SET k:Entry", k=keep)
+        self.q("MATCH (b:State {gid:$m}) DETACH DELETE b", m=merge)
+        return {"kept": keep, "merged": merge, "actions_moved": moved, "aliases": len(aliases),
+                "merged_state": _clean(pb)}
+
+    def rename_state(self, state_gid: str, summary: str, titles: list, state_vec: list | None = None,
+                     intents: list | None = None) -> dict:
+        """Replace a state's summary (and its embedding / 'open <title>' intents, computed by the caller so that a replay
+        needs no model)."""
+        rows = self.ro("MATCH (s:State {gid:$g}) RETURN coalesce(s.summary, '')", g=state_gid)
+        if not rows:
+            raise ValueError(f"unknown state {state_gid}")
+        self.q("MATCH (s:State {gid:$g}) SET s.summary = $sum, s.examples_n = $n", g=state_gid, sum=summary, n=len(titles))
+        if state_vec is not None:
+            self.q("MATCH (s:State {gid:$g}) SET s.emb = vecf32($v)", g=state_gid, v=state_vec)
+        for text, vec in intents or []:
+            self.q("""MERGE (i:Intent {gid:$ig})
+                      SET i.text = coalesce(i.text, $t), i.source = coalesce(i.source, 'llm'),
+                          i.hits = coalesce(i.hits, 0), i.emb = vecf32($v)
+                      WITH i MATCH (s:State {gid:$g})
+                      MERGE (i)-[f:FULFILLED_BY]->(s) SET f.score = coalesce(f.score, 1.0)""",
+                   ig=gid("in", normalize_text(text)), t=text, v=vec, g=state_gid)
+        return {"state": state_gid, "old_summary": rows[0][0], "new_summary": summary}

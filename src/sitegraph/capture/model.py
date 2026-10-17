@@ -103,3 +103,15 @@ class StateObs:
 
     def component(self, gid: str) -> ComponentObs | None:
         return next((c for c in self.components if c.gid == gid), None)
+
+
+def obs_to_dict(obs: StateObs) -> dict:
+    d = asdict(obs)
+    d.pop("raw", None)
+    return d
+
+
+def obs_from_dict(d: dict) -> StateObs:
+    comps = [ComponentObs(**{**c, "elements": [ElementObs(**e) for e in c["elements"]]}) for c in d["components"]]
+    rest = {k: v for k, v in d.items() if k not in ("components", "raw")}
+    return StateObs(**rest, components=comps)

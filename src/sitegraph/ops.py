@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from .db import GraphStore, ops_key
+from .embed import cosine
 from .ids import gid, now_ms, ulid
 from .normalize import url_template
 from .schema import ensure_ops_schema
@@ -11,23 +12,26 @@ from .schema import ensure_ops_schema
 class Ops:
     def __init__(self, store: GraphStore, uid: str, domain: str):
         self.store, self.key = store, ops_key(uid, domain)
-        ensure_ops_schema(store, self.key)
+        ensure_ops_schema(store, self.key, 384)
 
     def q(self, cypher: str, **params):
         return self.store.query(self.key, cypher, params)
 
     def register_agent(self, agent_id: str, role: str, device: str | None = None) -> None:
-        self.q("MERGE (a:Agent {id:$id}) SET a.role = $r, a.device = $d, a.status = 'idle', a.heartbeat = $now",
+        self.q("MERGE (a:Agent {id:$id}) SET a.role = coalesce(a.role, $r), a.device = coalesce(a.device, $d), a.status = 'idle', a.heartbeat = $now",
                id=agent_id, r=role, d=device, now=now_ms())
 
     def create_task(self, kind: str, request: str, device: str | None = None, priority: int = 0,
-                    parent: str | None = None, policy: dict | None = None) -> str:
+                    parent: str | None = None, policy: dict | None = None,
+                    depends_on: list[str] | None = None) -> str:
         tid = ulid("task")
         self.q("CREATE (:Task {id:$id, kind:$k, request:$r, device:$d, priority:$p, status:'queued', created:$now, "
                "policy:$pol})", id=tid, k=kind, r=request, d=device, p=priority, now=now_ms(),
                pol=json.dumps(policy) if policy else None)
         if parent:
             self.q("MATCH (c:Task {id:$c}), (p:Task {id:$p}) CREATE (c)-[:SUBTASK_OF]->(p)", c=tid, p=parent)
+        for d in depends_on or []:
+            self.q("MATCH (c:Task {id:$c}), (d:Task {id:$d}) CREATE (c)-[:DEPENDS_ON]->(d)", c=tid, d=d)
         return tid
 
     def assign(self, task_id: str, agent_id: str) -> None:
@@ -105,3 +109,44 @@ class Ops:
     def item_stats(self, scope: str) -> dict:
         rows = self.q("MATCH (w:WorkItem {scope:$s}) RETURN w.status, count(w), max(w.attempts)", s=scope)
         return {r[0]: {"count": r[1], "max_attempts": r[2]} for r in rows}
+
+    # ---------- coordination: dependencies, heartbeats, notes, handoffs ----------
+    def runnable(self, limit: int = 20) -> list[dict]:
+        """Queued tasks whose dependencies are all done, highest priority first."""
+        out = []
+        for (tid,) in self.q("MATCH (t:Task {status:'queued'}) RETURN t.id ORDER BY t.priority DESC, t.created"):
+            deps = self.q("MATCH (:Task {id:$t})-[:DEPENDS_ON]->(d:Task) RETURN d.status", t=tid)
+            if all(s == "done" for (s,) in deps):
+                out.append(self.get_task(tid))
+            if len(out) >= limit:
+                break
+        return out
+
+    def heartbeat(self, agent_id: str, status: str) -> None:
+        self.q("MATCH (a:Agent {id:$a}) SET a.status = $s, a.heartbeat = $now", a=agent_id, s=status, now=now_ms())
+
+    def add_note(self, text: str, agent_id: str, embedder=None, ref_graph: str | None = None,
+                 ref_gid: str | None = None) -> str:
+        """A short fact one agent leaves for the others (a login wall, a robots block); searchable by meaning."""
+        g = ulid("note")
+        self.q("MERGE (a:Agent {id:$a}) CREATE (n:Note {gid:$g, text:$t, ts:$now, ref_graph:$rg, ref_gid:$rid})"
+               "-[:BY]->(a)", a=agent_id, g=g, t=text, now=now_ms(), rg=ref_graph, rid=ref_gid)
+        if embedder is not None:
+            self.q("MATCH (n:Note {gid:$g}) SET n.emb = vecf32($v)", g=g, v=embedder.embed([text])[0])
+        return g
+
+    def notes(self, text: str, embedder, k: int = 5) -> list[tuple[str, float]]:
+        v = embedder.embed([text])[0]
+        rows = self.q("CALL db.idx.vector.queryNodes('Note', 'emb', $k, vecf32($v)) YIELD node "
+                      "RETURN node.text, node.emb", k=k, v=v)
+        return sorted(((t, cosine(v, list(e))) for t, e in rows), key=lambda r: r[1], reverse=True)
+
+    def record_handoff(self, from_agent: str, to_agent: str, task_id: str | None, reason: str, context: dict) -> str:
+        g = ulid("ho")
+        self.q("""MERGE (f:Agent {id:$f}) MERGE (t:Agent {id:$t})
+                  CREATE (h:Handoff {gid:$g, reason:$r, context:$c, ts:$now}), (h)-[:FROM_AGENT]->(f),
+                         (h)-[:TO_AGENT]->(t)""", f=from_agent, t=to_agent, g=g, r=reason,
+               c=json.dumps(context), now=now_ms())
+        if task_id:
+            self.q("MATCH (h:Handoff {gid:$g}), (k:Task {id:$t}) CREATE (h)-[:FOR_TASK]->(k)", g=g, t=task_id)
+        return g

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 
-from ..agents.workflows import load_workflow_steps
+from ..agents.workflows import _edge, load_workflow_steps
 from ..graph.queries import RouteStep, best_routes, entry_state, find_nodes, find_targets
 from ..ids import now_ms, ulid
 from ..llm import complete_json
@@ -33,6 +33,7 @@ class Storyboard:
     scope_kind: str
     shots: list[ShotPlan]
     workflow_gid: str | None = None
+    map_commit: str | None = None      # the version of the map the demo was made against (git commit id)
 
 
 class StoryboardBuilder:
@@ -54,7 +55,7 @@ class StoryboardBuilder:
             raise DemoError("site has not been explored yet")
         return e[0]
 
-    def build(self, spec: DemoSpec, request_text: str) -> Storyboard:
+    def build(self, spec: DemoSpec, request_text: str, map_commit: str | None = None) -> Storyboard:
         vec = self.embedder.embed([spec.target])[0]
         entry = self._entry()
         wf_gid = None
@@ -105,7 +106,7 @@ class StoryboardBuilder:
         for i, s in enumerate(shots):
             s.i = i
         self._caption(shots, spec)
-        return self._persist(spec, request_text, shots, wf_gid)
+        return self._persist(spec, request_text, shots, wf_gid, map_commit)
 
     def _find_transition(self, vec) -> dict:
         for comp_gid, label, _ in find_nodes(self.store, self.key, "Component", vec, 5, "label"):
@@ -137,15 +138,17 @@ class StoryboardBuilder:
             for s in visible:
                 s.caption = s.caption[:1].upper() + s.caption[1:]
 
-    def _persist(self, spec: DemoSpec, request_text: str, shots: list[ShotPlan], wf_gid: str | None) -> Storyboard:
+    def _persist(self, spec: DemoSpec, request_text: str, shots: list[ShotPlan], wf_gid: str | None,
+                 map_commit: str | None = None) -> Storyboard:
         now = now_ms()
         rg, sg = ulid("dr"), ulid("sb")
         v = self.embedder.embed([request_text])[0]
         title = spec.target[:1].upper() + spec.target[1:]
         self.store.query(self.key, """CREATE (r:DemoRequest {gid:$rg, text:$t, emb:vecf32($v), interpretation:$i, ts:$now})
-            -[:PRODUCED]->(:Storyboard {gid:$sg, title:$title, scope_kind:$sk, status:'ok', version:1, ts:$now})""",
+            -[:PRODUCED]->(:Storyboard {gid:$sg, title:$title, scope_kind:$sk, status:'ok', version:1, ts:$now,
+                                                                  map_commit:$mc})""",
                          {"rg": rg, "t": request_text, "v": v, "i": json.dumps(asdict(spec)), "now": now, "sg": sg,
-                          "title": title, "sk": spec.scope_kind})
+                          "title": title, "sk": spec.scope_kind, "mc": map_commit})
         if wf_gid:
             self.store.query(self.key, "MATCH (sb:Storyboard {gid:$sg}), (w:Workflow {gid:$w}) "
                                        "CREATE (sb)-[:BASED_ON]->(w)", {"sg": sg, "w": wf_gid})
@@ -163,4 +166,32 @@ class StoryboardBuilder:
                                  {"g": shg, "s": show})
             s.transition = {**s.transition, "shot_gid": shg} if s.transition else None
             setattr(s, "gid", shg)
-        return Storyboard(sg, rg, title, spec.scope_kind, shots, wf_gid)
+        return Storyboard(sg, rg, title, spec.scope_kind, shots, wf_gid, map_commit)
+
+
+def load_storyboard(store, key, sb_gid: str) -> Storyboard:
+    """Rebuild a persisted storyboard (for a re-render): its shots, the steps they replay and the map commit."""
+    head = store.ro_query(key, """MATCH (r:DemoRequest)-[:PRODUCED]->(sb:Storyboard {gid:$g})
+                                  OPTIONAL MATCH (sb)-[:BASED_ON]->(w:Workflow)
+                                  RETURN r.gid, sb.title, sb.scope_kind, w.gid, sb.map_commit""", {"g": sb_gid})[0]
+    shots = []
+    for shg, i, kind, cap, hidden, ag, tg, show in store.ro_query(key, """
+            MATCH (sh:Shot)-[:IN_STORYBOARD]->(:Storyboard {gid:$g}) OPTIONAL MATCH (sh)-[:SHOWS]->(s:State)
+            RETURN sh.gid, sh.i, sh.kind, sh.caption, sh.hidden, sh.action_gid, sh.transition_gid, s.gid
+            ORDER BY sh.i""", {"g": sb_gid}):
+        step = transition = None
+        if ag:
+            e = _edge(store, key, ag)
+            if e:
+                step = RouteStep(action_gid=ag, label=e["label"], el_gid=e["el_gid"], src=e["src"], dst=e["dst"],
+                                 reliability=e["reliability"], pre_cstates=e["pre_cstates"],
+                                 requires_inputs=e["requires_inputs"], value_var=e["value_var"],
+                                 action_type=e["action_type"])
+        if tg:
+            e = _edge(store, key, tg)
+            if e:
+                transition = {"gid": tg, "el_gid": e["el_gid"], "action_type": e["action_type"]}
+        plan = ShotPlan(i, kind, cap, hidden, step=step, transition=transition, state_gid=show)
+        setattr(plan, "gid", shg)
+        shots.append(plan)
+    return Storyboard(sb_gid, head[0], head[1], head[2], shots, head[3], head[4])
