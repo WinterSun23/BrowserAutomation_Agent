@@ -1,6 +1,6 @@
 services:
   falkordb:
-    image: falkordb/falkordb:latest
+    image: falkordb/falkordb:v4.22.1
     ports: ["6379:6379", "3000:3000"]
     environment:
       - REDIS_ARGS=--appendonly yes --save 60 1
