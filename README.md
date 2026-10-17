@@ -4,7 +4,7 @@ SiteGraph is a Python agent system that explores a public website into a **Falko
 
 **Hackathon tracks:** T1 *Agents That Act on Connected Data* (primary) and T2 *Agent Memory & Coordination* (coordination is real: shared work items, claims and tasks in a graph; long-term memory is only partly built, see [Known limits](#known-limits)).
 
-> **Status:** the engine, graph, command line, LLM agents and MCP server are built. The web API and web UI (plan tasks 18-19) are **not built**; use the command line below. The agent layer has so far been exercised with scripted models only, not a live LLM (see [Known limits](#known-limits)).
+> **Status:** the engine, graph, command line, LLM agents and MCP server are built. The web API and web UI (plan tasks 18-19) are **not built**; use the command line below. The agents pass their scripted-model tests and a first live check with a small local model (see [Known limits](#known-limits)).
 
 ## Demo video
 
@@ -15,13 +15,13 @@ _To be recorded._
 Requires Docker, Python 3.11 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-docker compose up -d                      # FalkorDB on localhost:6379 (data persisted in ./data/falkordb)
+docker compose up -d                      # FalkorDB 4.22.1 on localhost:6379 (data in ./data/falkordb); 6.x is not supported yet
 uv venv --python 3.11 .venv && source .venv/bin/activate     # Windows Git Bash: . .venv/Scripts/activate
 uv pip install -e ".[dev]"
 python -m playwright install chromium
 
-# Optional: a model for summaries, intents, captions and request routing (any OpenAI-compatible API)
-export LLM_MODEL=openai/gpt-4o-mini LLM_API_KEY=...        # add LLM_API_BASE=... for a local server
+# Optional: a model for summaries, intents, captions, request routing and the agents (any LiteLLM model)
+cp .env.example .env                      # then set LLM_MODEL and LLM_API_KEY (or LLM_API_BASE for Ollama / a local server)
 
 python -m sitegraph run https://books.toscrape.com/ "explore the site" "open the travel category" "make a gif of the menu"
 ```
@@ -54,7 +54,7 @@ With `run`, each quoted request is run in order against the same site graph. Wha
 
 Without `LLM_API_KEY` the system still runs with built-in fallbacks (keyword routing, title-based summaries, plain captions). Embeddings use `BAAI/bge-small-en-v1.5` (downloaded once, ~130 MB); `--embedder hash` is an offline, much weaker stand-in for quick tests. Results are printed as JSON, and rendered files go to `data/blobs/`.
 
-Config lives in `config.yaml` (environment variables `LLM_MODEL`, `LLM_API_BASE`, `LLM_API_KEY`, `SITEGRAPH_*` override it).
+Config lives in `config.yaml`; a gitignored `.env` file and then real environment variables (`LLM_MODEL`, `LLM_API_BASE`, `LLM_API_KEY`, `SITEGRAPH_*`) override it. Model calls retry rate limits up to 3 times; a call that still fails falls back to the built-in default and logs a warning.
 
 ## Graph data model
 
@@ -234,8 +234,8 @@ Built with Claude Code (Anthropic) as a coding assistant; the graph model, queri
 
 ```bash
 pytest -m "not slow"     # skips video/GIF recording
-pytest                   # full suite; needs Docker (FalkorDB) and Chromium; about 15 minutes
-pytest -m llm            # live-model tests; need LLM_API_KEY (or LLM_API_BASE) and LLM_MODEL, skipped otherwise
+pytest                   # full suite; needs Docker (FalkorDB) and Chromium; about 18 minutes; never reads .env
+pytest -m llm            # live-model test; set LLM_MODEL and LLM_API_KEY (or LLM_API_BASE) in the environment, skipped otherwise
 ```
 
 Integration and browser tests are skipped (not failed) when FalkorDB is not running, so check the pass/skip counts.
@@ -244,10 +244,10 @@ Integration and browser tests are skipped (not failed) when FalkorDB is not runn
 
 - **No web UI/API yet** (plan tasks 18-19).
 - Actions supported: click, hover (desktop menus), text fill in forms (opt-in), auto-scroll to load lazy content. Not yet: `<select>` choice, checkbox/radio toggling, keyboard, drag/slider, touch gestures, virtualised-list scrolling.
-- **The agent layer has been tested with scripted models only.** The tool layer, loop, Execution agent and Navigator recovery have passing tests; the Curator review agent, Demo agent and MCP server were written with their tests but not yet run, and nothing has been run against a live LLM. A live-model evaluation protocol is in `docs/eval-agent-layer.md` (local, not in the repository).
+- **Live-model testing is limited.** Every agent passes its scripted-model tests (full suite: 206 passed). A first live check used a small local model (`qwen3:4b` through Ollama: tool calling, no vision): the live tool-call test passes, "take me to the travel category" and "find the cheapest book and open it" succeed, and "go to checkout" stays safe. The vision paths (Demo agent previews, Navigator recovery from a screenshot) have not been run against a real model. Results are in `docs/eval-agent-layer.md` (local, not in the repository).
 - Memory: the chat agent can `remember` / `recall` / `forget`, but only when asked or clearly useful; nothing learns preferences automatically and the fixed pipeline does not use memory, so the memory half of T2 is limited.
 - A recovery agent that needs your approval (for example a banner whose only button is destructive) cannot ask you mid-run: the step fails and the reason is recorded.
-- A persistent obstacle (a banner that returns every visit) is recovered from each time; the fix is not yet saved as an extra step of the route.
+- What the recovery agent did to get past an obstacle (closing a banner, choosing an option) is saved on that route step and replayed when the obstacle is on the page, so later runs need no model. Only actions within the allowed risk level are learned, and an obstacle whose element changes is recovered from again.
 - An element that appears late (timer, banner) is stored in the graph but only explored by a later run.
 - Exploration is slow (each path replays from a fresh page load); reusing a live page that already matches is a possible speed-up.
 - **Real-site quality is only partly proven.** Smoke tests on `books.toscrape.com` (no LLM configured, real `bge` embeddings, 2 agents, 7 states / ~10 actions) now handle "open the travel category", "take me to the mystery category" and "open philosophy" (item 33 of 50): pages that share a URL pattern stay one state (named after the last page seen, with a capped list of example titles), and the item is chosen from the live list by (1) text in the request, (2) meaning, (3) an LLM, else (4) the first item. Not yet tested: a real LLM, product pages (cards rather than plain links, where list-item text includes price and buttons), and the plan's "make a video showing how to open a book's page".
