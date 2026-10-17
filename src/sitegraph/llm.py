@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import re
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
+logger = logging.getLogger(__name__)
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
+NUM_RETRIES = 3  # LiteLLM retries rate limits and transient errors with backoff
 
 
 class LLM(Protocol):
@@ -92,8 +95,11 @@ def parse_json(text: str | None):
 def complete_json(llm: LLM, system: str, user: str, default=None, image_png: bytes | None = None):
     try:
         return parse_json(llm.complete(system + "\nRespond with a single JSON value only, no prose.", user, image_png))
-    except Exception:
+    except Exception as exc:
         if default is not None:
+            if not isinstance(llm, OfflineLLM):  # offline defaults are expected; a real model failing is not
+                logger.warning("LLM call failed, using the built-in default (%s: %s)", type(exc).__name__,
+                               str(exc)[:200])
             return default
         raise
 
@@ -113,7 +119,7 @@ class LiteLLMClient:
             content = [{"type": "text", "text": user},
                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}]
         resp = litellm.completion(model=self.model, api_base=self.api_base, api_key=self.api_key,
-                                  temperature=self.temperature,
+                                  temperature=self.temperature, num_retries=NUM_RETRIES,
                                   messages=[{"role": "system", "content": system},
                                             {"role": "user", "content": content}])
         return resp.choices[0].message.content or ""
@@ -127,7 +133,8 @@ class LiteLLMClient:
             payload[-1]["content"] = [{"type": "text", "text": payload[-1]["content"] or ""},
                                       {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}]
         resp = litellm.completion(model=self.model, api_base=self.api_base, api_key=self.api_key,
-                                  temperature=self.temperature, messages=payload, tools=tools or None)
+                                  temperature=self.temperature, num_retries=NUM_RETRIES, messages=payload,
+                                  tools=tools or None)
         return from_litellm(resp.choices[0].message, getattr(resp, "usage", None))
 
 
