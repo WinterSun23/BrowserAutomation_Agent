@@ -153,12 +153,20 @@ def _resolve(ctx: ToolContext, nav, el, item: str | None):
     return located
 
 
+def _acted(ctx: ToolContext, kind: str, el) -> None:
+    """Remember what was done on the page (the recovery agent's actions can be learned as steps of a route). Actions
+    above the policy are left out: an approval covers one action and must never be replayed automatically."""
+    if policy_of(ctx).allows(el):
+        ctx.extra.setdefault("acted", []).append(f"{kind}|{el.gid}")
+
+
 def click(ctx: ToolContext, args: dict):
     nav, el = get_nav(ctx), _element(ctx, args["element_id"])
     _guard(ctx, el)
     located = _resolve(ctx, nav, el, args.get("item"))
     before = ctx.extra.get("state")
     nav._click(located)
+    _acted(ctx, "click", el)
     return _after(ctx, nav, before, el, "click")
 
 
@@ -166,6 +174,7 @@ def hover(ctx: ToolContext, args: dict):
     nav, el = get_nav(ctx), _element(ctx, args["element_id"])
     _guard(ctx, el)
     nav._hover(_resolve(ctx, nav, el, args.get("item")))
+    _acted(ctx, "hover", el)
     return {"hovered": el.name_sample[:60], "next": "call observe to see anything that appeared (menus, tooltips)"}
 
 

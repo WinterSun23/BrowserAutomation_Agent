@@ -67,6 +67,7 @@ class NavigatorEscalation:
     def __init__(self, llm, settings, store, key, domain, embedder, blobs=None, device: str = "desktop"):
         self.llm, self.settings, self.store, self.key, self.domain = llm, settings, store, key, domain
         self.embedder, self.blobs, self.device = embedder, blobs, device
+        self.last_actions: list[str] = []
 
     def recover(self, ctx: EscalationContext, nav) -> AgentRun:
         """Run the recovery agent on the Navigator's own browser. The caller checks the page afterwards."""
@@ -81,7 +82,10 @@ class NavigatorEscalation:
         ctx.observation = look.to_message_text(self.settings.tool_result_max_chars)
         loop = AgentLoop(self.llm, box, RECOVERY_SYSTEM, self.settings.escalation_max_steps,
                          self.settings.agent_max_tokens)
-        return loop.run(ctx.to_prompt(), image_png=ctx.screenshot_png)
+        try:
+            return loop.run(ctx.to_prompt(), image_png=ctx.screenshot_png)
+        finally:
+            self.last_actions = list(tools.extra.get("acted", []))   # "click|<el_gid>" / "hover|<el_gid>", allowed ones
 
 
 def make_escalation(settings, store, key, domain, embedder, llm, blobs=None, device: str = "desktop"):

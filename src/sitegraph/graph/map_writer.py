@@ -162,6 +162,18 @@ class MapWriter:
     def record_attempt(self, action_gid: str, success: bool) -> None:
         self.q(_ATTEMPT, g=action_gid, succ=1 if success else 0, lam=self.s.cost_lambda, now=self.now())
 
+    def add_pre_actions(self, action_gid: str, actions: list[str]) -> None:
+        """Learned steps that must come before this action when their element is on the page (e.g. closing a banner,
+        choosing a size); tokens are 'click|<el_gid>' or 'hover|<el_gid>'."""
+        if actions:
+            self.q("MATCH ()-[r:ACTION {gid:$g}]->() "
+                   "SET r.pre_actions = coalesce(r.pre_actions, []) + [a IN $acts WHERE NOT a IN coalesce(r.pre_actions, [])]",
+                   g=action_gid, acts=list(dict.fromkeys(actions)))
+
+    def pre_actions(self, action_gid: str) -> list[str]:
+        rows = self.ro("MATCH ()-[r:ACTION {gid:$g}]->() RETURN r.pre_actions", g=action_gid)
+        return list(rows[0][0] or []) if rows else []
+
     def write_transition(self, comp_gid: str, src_cs: str, dst_cs: str, el: dict, action_type: str = "click",
                          src_name: str = "absent", dst_name: str = "open") -> str:
         g = gid("tr", src_cs, el["gid"], action_type, dst_cs)

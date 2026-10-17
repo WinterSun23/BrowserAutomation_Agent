@@ -42,6 +42,14 @@ def world(store, msettings, site_url):
     return store, msettings, key, domain, site_url
 
 
+@pytest.fixture(autouse=True)
+def _forget_learned_steps(request):
+    """The module shares one explored graph: start each test without steps learned by an earlier one."""
+    if "world" in request.fixturenames:
+        store, _, key, _, _ = request.getfixturevalue("world")
+        store.query(key, "MATCH ()-[r:ACTION]->() WHERE r.pre_actions IS NOT NULL SET r.pre_actions = []")
+
+
 def call(name, args=None, id="c"):
     return ChatMessage("assistant", tool_calls=[ToolCall(id, name, args or {})])
 
@@ -134,6 +142,60 @@ def test_no_llm_means_no_escalation_object():
     assert make_escalation(Settings(escalate_navigator=False), None, "k", "d", HashEmbedder(),
                            ScriptedLLM([])) is None
     assert isinstance(make_escalation(s, None, "k", "d", HashEmbedder(), ScriptedLLM([])), NavigatorEscalation)
+
+
+SIZE_GATE = """document.addEventListener('DOMContentLoaded', () => setTimeout(() => {
+  const g = document.createElement('div'); g.id = 'size-gate';
+  g.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:2147483000;display:flex;' +
+                    'align-items:center;justify-content:center';
+  g.innerHTML = '<div style="background:#fff;padding:24px"><p>Choose your size first.</p>' +
+                '<button id="size-m">Size M</button></div>';
+  g.querySelector('#size-m').onclick = () => g.remove();
+  document.body.appendChild(g);
+}, 0));"""
+
+
+def test_new_required_step_is_learned(world):
+    """A page inserts a 'choose size' step in front of the cart link. The recovery agent gets past it once; what it did
+    is stored on the route step, so the next run takes the step itself, without the model."""
+    store, _, key, _, _ = world
+    llm = ScriptedLLM([call("observe", id="c1"), button_id("Size M"), say("READY: I chose size M.")])
+    with BrowserSession() as s:
+        s.context.add_init_script(SIZE_GATE)
+        nav = _nav(world, s, llm)
+        step, _ = _cart_step(world, nav)
+        before = store.ro_query(key, "MATCH ()-[r:ACTION {gid:$g}]->() RETURN r.seen_count, r.success_count",
+                                {"g": step.action_gid})[0]
+        res = nav.execute_goal("open cart")
+        assert res.status == "done" and s.url.endswith("/cart.html"), res.explanation
+    learned, seen, ok = store.ro_query(key, "MATCH ()-[r:ACTION {gid:$g}]->() RETURN r.pre_actions, r.seen_count, "
+                                            "r.success_count", {"g": step.action_gid})[0]
+    size_m = store.ro_query(key, "MATCH (x:Element) WHERE x.name_sample = 'Size M' RETURN x.gid")[0][0]
+    assert learned == ["click|" + size_m]                                   # the new step is in the graph
+    assert seen - before[0] == 2 and ok - before[1] == 1                     # the failed first try still counts
+
+    silent = ScriptedLLM([])                                                 # would fail the run if it were called
+    with BrowserSession() as s:
+        s.context.add_init_script(SIZE_GATE)
+        res = _nav(world, s, silent, _settings(world, max_replans=0)).execute_goal("open cart")
+        assert res.status == "done" and s.url.endswith("/cart.html"), res.explanation
+    assert silent.calls == []                                                # no model needed the second time
+    with BrowserSession() as s:                                              # and a page without the gate is unaffected
+        res = _nav(world, s, silent, _settings(world, max_replans=0)).execute_goal("open cart")
+        assert res.status == "done" and s.url.endswith("/cart.html"), res.explanation
+
+
+def test_a_learned_step_never_clicks_a_different_element(world):
+    """'Accept cookies' (#accept) is learned; a later wall whose only button has the same id but a destructive name
+    must not be clicked by the replay (it would bypass the approval)."""
+    llm = ScriptedLLM([call("observe", id="c1"), button_id("Accept cookies"), say("READY: closed the banner.")])
+    with BrowserSession() as s:
+        s.context.add_init_script(COOKIE_WALL)
+        assert _nav(world, s, llm).execute_goal("open cart").status == "done"
+    with BrowserSession() as s:
+        s.context.add_init_script(RISKY_ONLY_WALL)
+        res = _nav(world, s, escalate=None, settings=_settings(world, max_replans=0)).execute_goal("open cart")
+        assert res.status == "failed" and s.page.locator("#cookie-wall").count() == 1   # nothing was clicked
 
 
 def test_the_number_of_escalations_per_run_is_limited(world):

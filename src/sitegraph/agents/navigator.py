@@ -360,7 +360,8 @@ class Navigator:
         try:
             run = self.escalation.recover(ctx, self)
             record = {"status": run.status, "error": ctx.error[:300], "answer": run.answer, "steps": run.steps,
-                      "tool_calls": run.tool_calls, "pending": [p["reason"] for p in run.pending]}
+                      "tool_calls": run.tool_calls, "pending": [p["reason"] for p in run.pending],
+                      "actions": list(getattr(self.escalation, "last_actions", []))}
         except Exception as exc:
             record = {"status": "error", "error": ctx.error[:300], "answer": str(exc)[:300], "steps": 0,
                       "tool_calls": [], "pending": []}
@@ -414,6 +415,37 @@ class Navigator:
             return False
         return self.write_state(self.observe()) == target_gid
 
+    def _run_pre_actions(self, action_gid: str) -> None:
+        """Steps learned from earlier recoveries (close a banner, choose a size). Each is optional: done only when its
+        element is on the page, found by its stored locators, and still within the policy."""
+        policy = self._policy or ExplorationPolicy()
+        for token in self.writer.pre_actions(action_gid):
+            kind, _, el_gid = token.partition("|")
+            pel = load_element(self.store, self.key, el_gid)
+            if not pel or not policy.allows(pel):
+                continue
+            loc = self.resolver.resolve(pel, locators_only=True)
+            if loc is None:
+                continue
+            try:
+                href = loc.locator.get_attribute("href", timeout=1000) if pel.get("role") == "link" else None
+                if href and (href.lower().startswith(("mailto:", "tel:", "javascript:"))
+                             or domain_of(href) not in ("", self.domain)):
+                    continue                                            # the same name now leads off the site
+                self._act(kind, loc)
+            except Exception:  # the obstacle went away in between: nothing to do
+                pass
+
+    def _learn_from_recovery(self, step: RouteStep) -> None:
+        """A recovered step worked: keep what the recovery agent did as steps of this action, and count the first try
+        as the failure it was (the action only works with those steps)."""
+        rec = self._last_recovery
+        if not rec:
+            return
+        self.writer.record_attempt(step.action_gid, False)
+        self.writer.add_pre_actions(step.action_gid, [a for a in rec.get("actions", [])
+                                                      if a.partition("|")[2] != step.el_gid])
+
     def _attach_recovery(self, step_gid: str, el: dict | None) -> None:
         if self._last_recovery:
             self.activity.add_observation("recovery", self._last_recovery, step_gid=step_gid,
@@ -430,6 +462,7 @@ class Navigator:
             loc = self.resolver.resolve(inp) if inp else None
             if loc:
                 loc.locator.fill(self._input_value(inp, params))
+        self._run_pre_actions(step.action_gid)
         el = load_element(self.store, self.key, step.el_gid)
         chosen = None
         if el and el.get("is_template") and not item_match and self._request_text:
@@ -473,6 +506,7 @@ class Navigator:
         if ok:
             self.writer.write_action(step.src, step.dst, el, step.action_type, step.value_var, step.pre_cstates,
                                      step.requires_inputs, success=True)
+            self._learn_from_recovery(step)
         else:
             self.writer.record_attempt(step.action_gid, False)
             self.writer.write_action(step.src, landed, el, step.action_type, step.value_var, step.pre_cstates,

@@ -71,9 +71,14 @@ class ElementResolver:
         self.session, self.embedder, self.llm = session, embedder, llm
         self.fp_threshold, self.emb_threshold = fp_threshold, emb_threshold
 
-    def resolve(self, el: dict, item_match: str | None = None) -> Located | None:
+    def resolve(self, el: dict, item_match: str | None = None, locators_only: bool = False) -> Located | None:
+        """`locators_only`: only locators that name the element (role + name, exact text, test id) and nothing fuzzier,
+        for optional steps where a wrong match is worse than none. A css locator could hit a different element with the
+        same id (and a different, riskier name)."""
         page = self.session.page
         for i, spec in enumerate(el.get("locators") or []):
+            if locators_only and not spec.startswith(("role=", "text=", "testid=")):
+                continue
             try:
                 loc = build_locator(page, spec, item_match)
                 if loc is None:
@@ -84,6 +89,8 @@ class ElementResolver:
                         return Located(loc.first, f"locator:{i}")
             except Exception:
                 continue
+        if locators_only:
+            return None
         fp = el.get("fingerprint") or {}
         if isinstance(fp, str):
             fp = json.loads(fp)
