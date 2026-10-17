@@ -7,6 +7,7 @@ from ..capture.segment import jaccard
 from ..config import Settings
 from ..db import GraphStore
 from ..ids import gid, now_ms
+from ..versions import ALGO_VERSION, SCHEMA_VERSION
 
 _COST = """WITH r
 SET r.reliability = toFloat(r.success_count + 1) / (r.seen_count + 2)
@@ -106,6 +107,20 @@ class MapWriter:
 
     def ro(self, cypher: str, **params):
         return self.store.ro_query(self.key, cypher, params)
+
+    def ensure_site(self, domain: str, device: str, device_profile: str, embed_model: str, embed_dim: int) -> dict:
+        """The Site node records which schema, identity rules and embedding model built this graph."""
+        rows = self.ro("MATCH (s:Site) RETURN s.embed_model, s.embed_dim, s.algo_version, s.schema_version LIMIT 1")
+        if rows and rows[0][0] and (rows[0][0] != embed_model or rows[0][1] != embed_dim):
+            raise ValueError(f"graph {self.key} was built with {rows[0][0]}/{rows[0][1]}, not {embed_model}/{embed_dim}")
+        self.q("""MERGE (s:Site {gid:$g})
+                  SET s.domain = $d, s.device = $dev, s.device_profile = $p, s.embed_model = $m, s.embed_dim = $dim,
+                      s.schema_version = $sv, s.algo_version = coalesce(s.algo_version, $av),
+                      s.first_seen = coalesce(s.first_seen, $now)""",
+               g=gid("site", domain, device), d=domain, dev=device, p=device_profile, m=embed_model, dim=embed_dim,
+               sv=SCHEMA_VERSION, av=ALGO_VERSION, now=self.now())
+        r = self.ro("MATCH (s:Site) RETURN s.algo_version, s.schema_version LIMIT 1")[0]
+        return {"algo_version": r[0], "schema_version": r[1]}
 
     def resolve_state(self, obs: StateObs) -> str | None:
         if self.ro("MATCH (s:State {gid:$g}) RETURN s.gid", g=obs.state_gid):

@@ -7,13 +7,16 @@ from dataclasses import dataclass
 from ..browser.session import BrowserSession
 from ..db import device_key, ops_key
 from ..demo.director import DemoDirector
+from ..graph.map_writer import MapWriter
 from ..graph.queries import entry_state, recommendations
+from ..migrate import rehash
 from ..ids import ulid
 from ..llm import complete_json
 from ..normalize import domain_of
 from ..ops import Ops
 from ..profile import Profile
 from ..schema import ensure_device_schema
+from ..versions import ALGO_VERSION
 from .curator import Curator
 from .escalation import make_curator_escalation, make_escalation
 from .navigator import ExploreReport, Navigator
@@ -65,6 +68,10 @@ class Orchestrator:
         domain = domain_of(url)
         info = SiteInfo(domain, device, device_key(self.s.uid, domain, device), ops_key(self.s.uid, domain), url)
         ensure_device_schema(self.store, info.key, self.s.embed_dim)
+        model = getattr(self.embedder, "model_name", None) or type(self.embedder).__name__
+        versions = MapWriter(self.store, info.key, self.s).ensure_site(domain, device, device, model, self.s.embed_dim)
+        if versions["algo_version"] != ALGO_VERSION:
+            rehash(self.store, info.key, self.blobs, self.s, domain)
         self.profile.register_site(domain, device, info.key, info.ops_key, url)
         ops = Ops(self.store, self.s.uid, domain)
         ops.register_agent(f"navigator-{device}", "navigator", device)
