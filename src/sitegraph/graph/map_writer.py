@@ -206,6 +206,17 @@ class MapWriter:
         self.q("MATCH (s:State {gid:$g}) " + ("SET s:Frontier" if n else "REMOVE s:Frontier"), g=state_gid)
         return n
 
-    def promote_locator(self, el_gid: str, locator: str) -> None:
-        self.q("MATCH (x:Element {gid:$g}) SET x.locators = [$l] + [y IN x.locators WHERE y <> $l], "
-               "x.heal_count = x.heal_count + 1", g=el_gid, l=locator)
+    def bump_locator(self, el_gid: str, locator: str, healed: bool = False) -> None:
+        """Count a locator that found the element (`Element.locator_hits`, JSON) and order the locators by hits, so the
+        ones that keep working are tried first. `healed`: it was found by a fallback, not the first locator."""
+        rows = self.ro("MATCH (x:Element {gid:$g}) RETURN x.locators, x.locator_hits", g=el_gid)
+        if not rows:
+            return
+        locs, hits = rows[0][0] or [], json.loads(rows[0][1] or "{}")
+        hits[locator] = hits.get(locator, 0) + 1
+        if locator not in locs:
+            locs = [locator] + locs
+        locs = sorted(locs, key=lambda l: -hits.get(l, 0))
+        self.q("MATCH (x:Element {gid:$g}) SET x.locators = $l, x.locator_hits = $h, "
+               "x.heal_count = coalesce(x.heal_count, 0) + $healed",
+               g=el_gid, l=locs, h=json.dumps(hits, sort_keys=True), healed=1 if healed else 0)

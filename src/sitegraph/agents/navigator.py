@@ -11,13 +11,13 @@ from ..capture.model import ElementObs, StateObs
 from ..capture.segment import CLICKABLE_ROLES, absent_cs_gid, build_state
 from ..graph.activity import ActivityLog
 from ..graph.map_writer import MapWriter
-from ..graph.queries import (Route, RouteStep, best_routes, entry_state, explain, find_targets, load_element,
-                             next_actions)
+from ..graph.queries import (Route, RouteStep, best_routes, entry_state, explain, find_targets, fulltext_elements,
+                             load_element, next_actions)
 from ..ids import ulid
 from ..normalize import domain_of, var_name
 from ..ops import Ops
 from ..policy import ExplorationPolicy, robots_allowed
-from ..visual import crop_png, dhash, hamming_hex
+from ..visual import crop_png, dhash, hamming_hex, to_png
 
 
 @dataclass
@@ -67,7 +67,9 @@ class Navigator:
         self._ops = ops                         # created on first use, so a Navigator can exist without a database
         self.writer = MapWriter(store, key, settings)
         self.activity = ActivityLog(store, key)
-        self.resolver = ElementResolver(session, embedder, llm)
+        self.resolver = ElementResolver(session, embedder, llm, graph=lambda el: fulltext_elements(
+            store, key, el.get("name_sample") or "", el.get("role"), el.get("gid"),
+            max_risk_cost=int(el.get("risk_cost") or 0)))
         self._request_text: str | None = None
         self.escalation = escalate            # NavigatorEscalation or None (see agents/escalation.py)
         self._escalations = 0
@@ -357,10 +359,9 @@ class Navigator:
     def _heal_bookkeeping(self, el: dict, located: Located, step_gid: str) -> None:
         self.activity.add_observation("heal", {"method": located.method}, step_gid=step_gid, of_gid=el["gid"])
         if located.method.startswith("locator:"):
-            idx = int(located.method.split(":")[1])
-            self.writer.promote_locator(el["gid"], el["locators"][idx])
+            self.writer.bump_locator(el["gid"], el["locators"][int(located.method.split(":")[1])], healed=True)
         elif located.css:
-            self.writer.promote_locator(el["gid"], f"css={located.css}")
+            self.writer.bump_locator(el["gid"], f"css={located.css}", healed=True)
 
     def _enter_cstate(self, cs_gid: str) -> bool:
         rows = self.store.ro_query(self.key, "MATCH (:ComponentState)-[t:TRANSITION]->(:ComponentState {gid:$cs}) "
@@ -449,6 +450,19 @@ class Navigator:
             return False
         return self.write_state(self.observe()) == target_gid
 
+    def _reference_png(self, state_gid: str, el: dict) -> bytes | None:
+        """The element as it looked when its state was first captured (a crop of that screenshot), for vision healing."""
+        if self.blobs is None:
+            return None
+        rows = self.store.ro_query(self.key, "MATCH (s:State {gid:$g}) RETURN s.screenshot_ref", {"g": state_gid})
+        bbox = (el.get("fingerprint") or {}).get("bbox")
+        if not rows or not rows[0][0] or not bbox:
+            return None
+        try:
+            return crop_png(to_png(self.blobs.read(rows[0][0])), bbox, pad=24)
+        except Exception:
+            return None
+
     def _run_pre_actions(self, action_gid: str) -> None:
         """Steps learned from earlier recoveries (close a banner, choose a size). Each is optional: done only when its
         element is on the page, found by its stored locators, and still within the policy."""
@@ -506,7 +520,8 @@ class Navigator:
                                     self.s.item_match_threshold, self.s.item_match_margin)
             if item:
                 item_match, chosen = item, {"item": item, "method": how, "candidates": len(texts)}
-        located = self.resolver.resolve(el, item_match=item_match) if el else None
+        located = (self.resolver.resolve(el, item_match=item_match, reference_png=self._reference_png(step.src, el))
+                   if el else None)
         error = None if located is not None else "element not found"
         full_error, clicked, reached = error, None, False
         if located is not None:
@@ -541,6 +556,8 @@ class Navigator:
             self.writer.write_action(step.src, step.dst, el, step.action_type, step.value_var, step.pre_cstates,
                                      step.requires_inputs, success=True)
             self._learn_from_recovery(step)
+            if clicked is not None and not healed and el.get("locators"):
+                self.writer.bump_locator(el["gid"], el["locators"][0])   # hit counts reflect normal use too
         else:
             self.writer.record_attempt(step.action_gid, False)
             self.writer.write_action(step.src, landed, el, step.action_type, step.value_var, step.pre_cstates,

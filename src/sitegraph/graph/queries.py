@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -221,3 +222,17 @@ def recommendations(store: GraphStore, key: str, max_risk_cost: int) -> dict:
             "suggested_workflows": mine_sequences(store, key),
             "demo_candidates": [{"gid": g, "summary": s, "score": d} for g, s, d in demo],
             "workflows": [{"gid": g, "name": n, "demo_score": d, "runs": r} for g, n, d, r in wfs]}
+
+
+def fulltext_elements(store: GraphStore, key: str, text: str, role: str | None, exclude_gid: str | None,
+                      k: int = 5, max_risk_cost: int | None = None) -> list[dict]:
+    """Other known elements whose name matches `text` (graph healing alternatives). With `max_risk_cost`, only
+    elements no riskier than that: a broken 'Cart' must never be healed into 'Empty cart'."""
+    words = " ".join(re.findall(r"[A-Za-z0-9]+", text or ""))
+    if not words:
+        return []
+    rows = store.ro_query(key, "CALL db.idx.fulltext.queryNodes('Element', $q) YIELD node "
+                               "RETURN node.gid, node.role, coalesce(node.risk_cost, 0) LIMIT 25", {"q": words})
+    gids = [g for g, r, rc in rows if (role is None or r == role) and g != exclude_gid
+            and (max_risk_cost is None or rc <= max_risk_cost)][:k]
+    return [e for e in (load_element(store, key, g) for g in gids) if e]

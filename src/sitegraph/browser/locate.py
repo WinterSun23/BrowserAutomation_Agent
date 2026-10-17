@@ -7,6 +7,7 @@ from difflib import SequenceMatcher
 
 from ..embed import cosine
 from ..llm import complete_json
+from ..visual import draw_marks, side_by_side
 
 
 @dataclass
@@ -67,30 +68,46 @@ def score_candidate(fp: dict, cand: dict) -> float:
 
 
 class ElementResolver:
-    def __init__(self, session, embedder=None, llm=None, fp_threshold: float = 0.65, emb_threshold: float = 0.80):
-        self.session, self.embedder, self.llm = session, embedder, llm
+    """Find a remembered element on the live page: stored locators, then other graph elements with a matching name,
+    then fingerprint, embedding, a vision set-of-marks match and finally a text LLM match."""
+
+    def __init__(self, session, embedder=None, llm=None, graph=None, fp_threshold: float = 0.65,
+                 emb_threshold: float = 0.80):
+        self.session, self.embedder, self.llm, self.graph = session, embedder, llm, graph
         self.fp_threshold, self.emb_threshold = fp_threshold, emb_threshold
 
-    def resolve(self, el: dict, item_match: str | None = None, locators_only: bool = False) -> Located | None:
-        """`locators_only`: only locators that name the element (role + name, exact text, test id) and nothing fuzzier,
-        for optional steps where a wrong match is worse than none. A css locator could hit a different element with the
-        same id (and a different, riskier name)."""
+    def _try_locators(self, locators, item_match, name_bearing_only: bool = False):
         page = self.session.page
-        for i, spec in enumerate(el.get("locators") or []):
-            if locators_only and not spec.startswith(("role=", "text=", "testid=")):
+        for i, spec in enumerate(locators or []):
+            if name_bearing_only and not spec.startswith(("role=", "text=", "testid=")):
                 continue
             try:
                 loc = build_locator(page, spec, item_match)
                 if loc is None:
                     continue
                 n = loc.count()
-                if n == 1 or (n >= 1 and spec.startswith("item=")):
-                    if loc.first.is_visible():
-                        return Located(loc.first, f"locator:{i}")
+                if (n == 1 or (n >= 1 and spec.startswith("item="))) and loc.first.is_visible():
+                    return i, loc.first
             except Exception:
                 continue
+        return None
+
+    def resolve(self, el: dict, item_match: str | None = None, reference_png: bytes | None = None,
+                locators_only: bool = False) -> Located | None:
+        """`locators_only`: only locators that name the element (role + name, exact text, test id) and nothing fuzzier,
+        for optional steps where a wrong match is worse than none. A css locator could hit a different element with the
+        same id (and a different, riskier name). `reference_png`: a crop of the element as it was, for the vision match."""
+        page = self.session.page
+        hit = self._try_locators(el.get("locators"), item_match, name_bearing_only=locators_only)
+        if hit:
+            return Located(hit[1], f"locator:{hit[0]}")
         if locators_only:
             return None
+        if self.graph is not None:
+            for j, alt in enumerate(self.graph(el) or []):
+                hit = self._try_locators(alt.get("locators"), item_match)
+                if hit:
+                    return Located(hit[1], f"graph:{j}", None)
         fp = el.get("fingerprint") or {}
         if isinstance(fp, str):
             fp = json.loads(fp)
@@ -107,6 +124,16 @@ class ElementResolver:
             sims = sorted(((cosine(target, v), c) for v, c in zip(vecs, cands)), key=lambda t: t[0], reverse=True)
             if sims[0][0] >= self.emb_threshold:
                 return Located(page.locator(sims[0][1].css).first, "embedding", sims[0][1].css)
+        if self.llm and reference_png is not None:
+            shown = cands[:30]
+            img = side_by_side(reference_png, draw_marks(self.session.screenshot_png(), [c.bbox for c in shown]))
+            ans = complete_json(self.llm, "You match a UI element shown on the left to a numbered box on the right.",
+                                f"Left: the remembered element ({el.get('role')} '{el.get('name_sample')}'). "
+                                'Right: the current page with numbered boxes. Return {"index": <number or -1>}',
+                                default={"index": -1}, image_png=img)
+            idx = ans.get("index", -1) if isinstance(ans, dict) else -1
+            if isinstance(idx, int) and 0 <= idx < len(shown):
+                return Located(page.locator(shown[idx].css).first, "vision", shown[idx].css)
         if self.llm:
             listing = "\n".join(f"{i}. {c.role} '{c.name[:60]}'" for i, c in enumerate(cands[:60]))
             ans = complete_json(self.llm, "You match a remembered UI element to the current page.",

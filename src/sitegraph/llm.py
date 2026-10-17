@@ -171,7 +171,9 @@ class FakeLLM:
     def __init__(self, responder: Callable[[str, str], str] | None = None):
         self.responder = responder
         self.calls: list[tuple[str, str]] = []
+        self.images: list[bytes | None] = []
 
     def complete(self, system: str, user: str, image_png: bytes | None = None) -> str:
         self.calls.append((system, user))
+        self.images.append(image_png)
         return self.responder(system, user) if self.responder else "{}"
