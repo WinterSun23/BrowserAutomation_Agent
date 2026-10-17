@@ -74,22 +74,22 @@ class Ops:
     # kind 'page'  : load `url` and scan it (page-level work)
     # kind 'click' : try element `el_gid` on `url` after replaying the clicks in `pre` (path-level work)
     def add_item(self, scope: str, graph: str, kind: str, url: str, depth: int, el_gid: str | None = None,
-                 pre=(), pre_cstates=()) -> str:
+                 pre=(), pre_cstates=(), priority: float = 0.0) -> str:
         g = gid("wk", scope, graph, kind, url_template(url), el_gid or "", *pre)
         self.q("""MERGE (w:WorkItem {gid:$g})
                   SET w.scope = $scope, w.graph = $graph, w.kind = $kind, w.url = coalesce(w.url, $url),
                       w.depth = coalesce(w.depth, $depth), w.el_gid = $el, w.pre = $pre, w.pre_cstates = $pcs,
                       w.status = coalesce(w.status, 'open'), w.attempts = coalesce(w.attempts, 0),
-                      w.created = coalesce(w.created, $now)""",
+                      w.created = coalesce(w.created, $now), w.priority = coalesce(w.priority, $prio)""",
                g=g, scope=scope, graph=graph, kind=kind, url=url, depth=depth, el=el_gid, pre=list(pre),
-               pcs=list(pre_cstates), now=now_ms())
+               pcs=list(pre_cstates), now=now_ms(), prio=float(priority))
         return g
 
     def next_item(self, scope: str, agent_id: str, graph: str, ttl_ms: int = 120000) -> tuple[dict | None, bool]:
         """Claim the next open item. Returns (item, others_hold_open_items)."""
         rows = self.q("MATCH (w:WorkItem {scope:$s, status:'open'}) "
                       "RETURN w.gid, w.kind, w.url, w.depth, w.el_gid, w.pre, w.pre_cstates "
-                      "ORDER BY w.depth, w.created, w.gid LIMIT 50", s=scope)
+                      "ORDER BY coalesce(w.priority, 0.0) DESC, w.depth, w.created, w.gid LIMIT 50", s=scope)
         if not rows:
             return None, False
         for g, kind, url, depth, el, pre, pcs in rows:

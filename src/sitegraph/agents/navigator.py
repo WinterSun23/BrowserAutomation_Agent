@@ -69,6 +69,7 @@ class Navigator:
         self.secrets = secrets                  # Callable[[str], str | None]: vault lookup by variable name
         self.notes = notes                      # Callable[[str, str | None], None]: leave a note for other agents
         self._work_key = key                    # graph key used in work-item ids (shared across branch graphs)
+        self._prioritize = None                 # ElementObs -> float: priority of new click items (guided exploration)
         self._ops = ops                         # created on first use, so a Navigator can exist without a database
         self.writer = writer or MapWriter(store, key, settings)
         self.activity = ActivityLog(store, key)
@@ -237,7 +238,8 @@ class Navigator:
         (desktop only: touch devices have no hover)."""
         can_hover = getattr(self.session, "device", "desktop") == "desktop"
         for e in els:
-            self.ops.add_item(scope, self._work_key, "click", url, depth, el_gid=e.gid, pre=pre, pre_cstates=pre_cstates)
+            self.ops.add_item(scope, self._work_key, "click", url, depth, el_gid=e.gid, pre=pre, pre_cstates=pre_cstates,
+                              priority=float(self._prioritize(e)) if self._prioritize else 0.0)
             if can_hover and e.hoverable:
                 self.ops.add_item(scope, self._work_key, "hover", url, depth, el_gid=e.gid, pre=pre,
                                   pre_cstates=pre_cstates)
@@ -334,7 +336,7 @@ class Navigator:
         return step_i + 1
 
     def explore(self, entry_url: str | list[str], policy: ExplorationPolicy, scope: str | None = None,
-                work_key: str | None = None) -> ExploreReport:
+                work_key: str | None = None, prioritize=None) -> ExploreReport:
         """Pull-and-claim exploration. Several Navigators may call this with the same `scope` (and graph) at once:
         work lives as WorkItems in the ops graph and each item is claimed, so no two agents repeat the same
         page visit or the same path (element plus the clicks that lead to it)."""
@@ -345,6 +347,7 @@ class Navigator:
         seeds = [entry_url] if isinstance(entry_url, str) else list(entry_url)
         entry_url = seeds[0]
         self._work_key = work_key or self.key
+        self._prioritize = prioritize
         run = self._start("explore", f"explore {entry_url}")
         report = ExploreReport(run_gid=run)
         self.ops.register_agent(self.agent_id, "navigator")
@@ -706,6 +709,9 @@ class Navigator:
             return ExecResult(run, "no_target", None, None, 0, 0, f"No known screen matches '{goal}'.")
         status, cur, route, replans, heals = self.drive_to(states[0].gid, run, [0], params, policy, item_match)
         self._finish(run, status)
+        if status == "done" and states[0].intent:
+            self.store.query(self.key, "MATCH (i:Intent {gid:$g}) SET i.hits = coalesce(i.hits, 0) + 1",
+                             {"g": states[0].intent})
         text = explain(route) if route else ("Already there." if status == "done" else "No allowed route.")
         return ExecResult(run, status, route, cur, replans, heals, text)
 

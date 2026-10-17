@@ -9,8 +9,8 @@ from ..graph.queries import entry_state
 from ..graph.recording import copy_activity
 from ..ids import now_ms, ulid
 from .capture import CaptureResult, DemoCapturer
-from .render import (render_clickthrough_html, render_gif, render_guide_html, render_video,
-                     render_video_segments)
+from .render import (render_clickthrough_html, render_gif, render_guide_html, render_guide_markdown,
+                     render_video, render_video_segments)
 from .spec import DemoSpec, interpret
 from .storyboard import Storyboard, StoryboardBuilder, load_storyboard
 
@@ -42,7 +42,12 @@ class DemoDirector:
             start_url = entry[1] if entry else None
         cap = self._capture(self.key, sb, start_url)
         self._link_steps(sb, cap)
-        return DemoResult(sb.gid, self.render_all(sb, cap, spec.formats), spec)
+        return DemoResult(sb.gid, self.render_all(sb, cap, self._with_markdown(spec.formats), spec), spec)
+
+    @staticmethod
+    def _with_markdown(formats: list[str]) -> list[str]:
+        """A guide also comes as Markdown + images (zip), which docs and wikis take directly."""
+        return formats + ["guide_md"] if "guide" in formats and "guide_md" not in formats else list(formats)
 
     def _capture(self, key: str, sb: Storyboard, start_url: str) -> CaptureResult:
         """Record the storyboard. On the live map, the capture's map writes go through git (a commit on main) and the
@@ -83,18 +88,19 @@ class DemoDirector:
             copy_activity(self.store, key, self.key)
             self.store.delete(key)
         self._link_steps(sb, cap)
-        renders = self.render_all(sb, cap, spec.formats)
+        renders = self.render_all(sb, cap, self._with_markdown(spec.formats), spec)
         self.store.query(self.key, "MATCH (s:Storyboard {gid:$g}) SET s.version = s.version + 1, s.status = 'ok'",
                          {"g": sb_gid})
         return DemoResult(sb_gid, renders, spec)
 
-    def render_all(self, sb: Storyboard, cap: CaptureResult, formats: list[str]) -> list[tuple[str, str]]:
+    def render_all(self, sb: Storyboard, cap: CaptureResult, formats: list[str],
+                   spec: DemoSpec | None = None) -> list[tuple[str, str]]:
         """Render every format, recording a Render node (ok or failed) for each."""
         renders = []
         for fmt in formats:
             rg = ulid("rd")
             try:
-                ref = self._render(fmt, sb, cap)
+                ref = self._render(fmt, sb, cap, spec)
                 status, err = "ok", None
                 renders.append((fmt, ref))
             except Exception as exc:  # one failed format must not lose the others
@@ -116,15 +122,33 @@ class DemoDirector:
         return [(s.caption, cap.keyframes[s.i], cap.hotspots.get(s.i)) for s in sb.shots
                 if not s.hidden and s.i in cap.keyframes]
 
-    def _render(self, fmt: str, sb: Storyboard, cap: CaptureResult) -> str:
+    def _narrate(self, video: Path, sb: Storyboard, cap: CaptureResult, tmp: Path, gaps: bool) -> Path:
+        """Speak each visible shot's narration at the moment the shot starts in the finished video."""
+        from .tts import mix_narration, synthesize
+
+        visible = [s for s in sb.shots if not s.hidden and s.i in cap.shot_segments]
+        wavs = synthesize([s.narration or s.caption for s in visible], tmp / "tts")
+        starts, elapsed = [], 0.0
+        for s in visible:
+            a, b = cap.shot_segments[s.i]
+            starts.append(elapsed if gaps else a - cap.segments[0][0])    # cut footage: cumulative; contiguous: offset
+            elapsed += b - a
+        return mix_narration(video, tmp / "demo-narrated.mp4", list(zip(starts, wavs)))
+
+    def _render(self, fmt: str, sb: Storyboard, cap: CaptureResult, spec: DemoSpec | None = None) -> str:
         tmp = Path(tempfile.mkdtemp(prefix="sg_render_"))
         start = cap.segments[0][0] if cap.segments else 0.0
         end = cap.segments[-1][1] if cap.segments else start + 5
         gaps = any(b[0] - a[1] > 0.5 for a, b in zip(cap.segments, cap.segments[1:]))   # skipped footage in between
         if fmt == "video":
-            if gaps:
-                return self.blobs.put_file(render_video_segments(cap.video_path, tmp / "demo.mp4", cap.segments))
-            return self.blobs.put_file(render_video(cap.video_path, tmp / "demo.mp4", start))
+            out = (render_video_segments(cap.video_path, tmp / "demo.mp4", cap.segments) if gaps
+                   else render_video(cap.video_path, tmp / "demo.mp4", start))
+            if spec is not None and spec.narration:
+                try:
+                    out = self._narrate(out, sb, cap, tmp, gaps)
+                except Exception:             # no TTS engine installed (pip install pyttsx3): keep the silent video
+                    pass
+            return self.blobs.put_file(out)
         if fmt == "gif":
             if gaps:
                 joined = render_video_segments(cap.video_path, tmp / "joined.mp4", cap.segments)
@@ -134,6 +158,8 @@ class DemoDirector:
         if fmt == "screenshot":
             last = max(cap.keyframes)
             return self.blobs.put_screenshot(cap.keyframes[last])
+        if fmt == "guide_md":
+            return self.blobs.put_bytes(render_guide_markdown(sb.title, self._slides(sb, cap)), ".zip")
         if fmt == "guide":
             return self.blobs.put_bytes(render_guide_html(sb.title, self._slides(sb, cap)).encode(), ".html")
         if fmt == "clickthrough":

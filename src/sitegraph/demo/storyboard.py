@@ -23,6 +23,7 @@ class ShotPlan:
     step: RouteStep | None = None
     transition: dict | None = None   # {gid, el_gid, comp_gid, state_gid}
     state_gid: str | None = None
+    narration: str = ""      # spoken text for a voiceover (empty: the caption is spoken)
 
 
 @dataclass
@@ -89,6 +90,36 @@ class StoryboardBuilder:
             shots += self._route(entry, tr["state_gid"], hidden=True)
             shots.append(ShotPlan(0, "micro", tr["label"], False, transition=tr, state_gid=tr["state_gid"]))
             shots.append(ShotPlan(0, "still", tr["label"], False, state_gid=tr["state_gid"]))
+        elif spec.scope_kind == "highlights":
+            wfs = [r[0] for r in self.ro("MATCH (w:Workflow) WHERE w.status = 'active' "
+                                         "RETURN w.gid ORDER BY coalesce(w.demo_score, 0.0) DESC LIMIT 3")]
+            cur = entry
+            if wfs:
+                for wfg in wfs:
+                    steps = [s for s in load_workflow_steps(self.store, self.key, wfg) if s["kind"] == "ACTION"]
+                    if not steps:
+                        continue
+                    try:
+                        shots += self._route(cur, steps[0]["src"], hidden=True)
+                    except DemoError:
+                        continue
+                    for st in steps:
+                        shots.append(ShotPlan(0, "navigate", st["label"], False, step=RouteStep(
+                            action_gid=st["action_gid"], label=st["label"], el_gid=st["el_gid"], src=st["src"],
+                            dst=st["dst"], reliability=st["reliability"], pre_cstates=st["pre_cstates"],
+                            requires_inputs=st["requires_inputs"], value_var=st["value_var"],
+                            action_type=st["action_type"])))
+                    cur = steps[-1]["dst"]
+            else:
+                for (sg,) in self.ro("MATCH (s:State) RETURN s.gid ORDER BY coalesce(s.demo_score, 0.0) DESC LIMIT 3"):
+                    try:
+                        shots += self._route(cur, sg, hidden=False)
+                        cur = sg
+                    except DemoError:
+                        continue
+            if not shots:
+                raise DemoError("nothing to highlight yet: explore the site or save a workflow first")
+            shots.append(ShotPlan(0, "still", "That's the tour", False, state_gid=cur))
         else:  # feature
             found = find_nodes(self.store, self.key, "Feature", vec, 1)
             if not found:
@@ -137,6 +168,16 @@ class StoryboardBuilder:
         else:
             for s in visible:
                 s.caption = s.caption[:1].upper() + s.caption[1:]
+        if spec.narration:
+            narr = complete_json(self.llm, "You write spoken narration for product demo videos.",
+                                 f"Audience: {spec.audience}\nShots:\n{listing}\nReturn a JSON list with one or two "
+                                 "spoken sentences per shot, same order.", default=[])
+            if isinstance(narr, list) and len(narr) == len(visible):
+                for s, n in zip(visible, narr):
+                    s.narration = str(n)[:400]
+            else:
+                for s in visible:
+                    s.narration = s.caption
 
     def _persist(self, spec: DemoSpec, request_text: str, shots: list[ShotPlan], wf_gid: str | None,
                  map_commit: str | None = None) -> Storyboard:
@@ -156,11 +197,12 @@ class StoryboardBuilder:
             shg = ulid("sh")
             show = s.state_gid or (s.step.dst if s.step else None)
             self.store.query(self.key, """MATCH (sb:Storyboard {gid:$sg})
-                CREATE (:Shot {gid:$g, i:$i, kind:$k, caption:$c, hidden:$h, action_gid:$ag, transition_gid:$tg})
+                CREATE (:Shot {gid:$g, i:$i, kind:$k, caption:$c, hidden:$h, action_gid:$ag, transition_gid:$tg,
+                              narration:$n})
                        -[:IN_STORYBOARD]->(sb)""",
                              {"sg": sg, "g": shg, "i": s.i, "k": s.kind, "c": s.caption, "h": s.hidden,
                               "ag": s.step.action_gid if s.step else None,
-                              "tg": s.transition["gid"] if s.transition else None})
+                              "tg": s.transition["gid"] if s.transition else None, "n": s.narration})
             if show:
                 self.store.query(self.key, "MATCH (sh:Shot {gid:$g}), (st:State {gid:$s}) CREATE (sh)-[:SHOWS]->(st)",
                                  {"g": shg, "s": show})
@@ -175,9 +217,10 @@ def load_storyboard(store, key, sb_gid: str) -> Storyboard:
                                   OPTIONAL MATCH (sb)-[:BASED_ON]->(w:Workflow)
                                   RETURN r.gid, sb.title, sb.scope_kind, w.gid, sb.map_commit""", {"g": sb_gid})[0]
     shots = []
-    for shg, i, kind, cap, hidden, ag, tg, show in store.ro_query(key, """
+    for shg, i, kind, cap, hidden, ag, tg, narr, show in store.ro_query(key, """
             MATCH (sh:Shot)-[:IN_STORYBOARD]->(:Storyboard {gid:$g}) OPTIONAL MATCH (sh)-[:SHOWS]->(s:State)
-            RETURN sh.gid, sh.i, sh.kind, sh.caption, sh.hidden, sh.action_gid, sh.transition_gid, s.gid
+            RETURN sh.gid, sh.i, sh.kind, sh.caption, sh.hidden, sh.action_gid, sh.transition_gid,
+                   coalesce(sh.narration, ''), s.gid
             ORDER BY sh.i""", {"g": sb_gid}):
         step = transition = None
         if ag:
@@ -191,7 +234,7 @@ def load_storyboard(store, key, sb_gid: str) -> Storyboard:
             e = _edge(store, key, tg)
             if e:
                 transition = {"gid": tg, "el_gid": e["el_gid"], "action_type": e["action_type"]}
-        plan = ShotPlan(i, kind, cap, hidden, step=step, transition=transition, state_gid=show)
+        plan = ShotPlan(i, kind, cap, hidden, step=step, transition=transition, state_gid=show, narration=narr)
         setattr(plan, "gid", shg)
         shots.append(plan)
     return Storyboard(sb_gid, head[0], head[1], head[2], shots, head[3], head[4])

@@ -17,6 +17,7 @@ class Target:
     text: str
     score: float
     item: str | None = None   # set when the target was found through a list item the request names ('Travel')
+    intent: str | None = None  # the Intent that led to it (its hits are counted when the goal is reached)
 
 
 @dataclass
@@ -72,16 +73,18 @@ def find_targets(store: GraphStore, key: str, vec: list[float], k: int = 5, text
     rows = store.ro_query(key, """
         CALL db.idx.vector.queryNodes('Intent', 'emb', $k, vecf32($v)) YIELD node
         MATCH (node)-[f:FULFILLED_BY]->(t)
-        RETURN labels(t)[0], t.gid, coalesce(t.summary, t.name, node.text), node.emb, coalesce(f.score, 1.0)""",
+        RETURN labels(t)[0], t.gid, coalesce(t.summary, t.name, node.text), node.emb, coalesce(f.score, 1.0),
+               node.gid""",
                           {"k": k, "v": vec})
-    for label, g, text, emb, fscore in rows:
+    for label, g, text, emb, fscore, ig in rows:
         score = cosine(vec, list(emb)) * fscore
         if g not in out or out[g].score < score:
-            out[g] = Target(label, g, text or "", score, out[g].item if g in out else None)
+            out[g] = Target(label, g, text or "", score, out[g].item if g in out else None, ig)
     for label in ("Workflow", "State"):
         for g, text, sim in find_nodes(store, key, label, vec, k, "summary" if label == "State" else "name"):
             if g not in out or out[g].score < sim:
-                out[g] = Target(label, g, text, sim, out[g].item if g in out else None)
+                out[g] = Target(label, g, text, sim, out[g].item if g in out else None,
+                                out[g].intent if g in out else None)
     return sorted(out.values(), key=lambda t: t.score, reverse=True)[:k]
 
 
@@ -145,9 +148,9 @@ def frontier_states(store: GraphStore, key: str, depth: int = 8, limit: int = 10
         CALL algo.bfs(e, $depth, 'ACTION') YIELD nodes
         UNWIND nodes + [e] AS n
         WITH DISTINCT n WHERE n:Frontier
-        RETURN n.gid, coalesce(n.summary, ''), n.untried_count
-        ORDER BY n.untried_count DESC LIMIT $limit""", {"depth": depth, "limit": limit})
-    return [dict(gid=r[0], summary=r[1], untried=r[2]) for r in rows]
+        RETURN n.gid, coalesce(n.summary, ''), n.untried_count, coalesce(n.harmonic, 0.0)
+        ORDER BY n.untried_count DESC, coalesce(n.harmonic, 0.0) DESC LIMIT $limit""", {"depth": depth, "limit": limit})
+    return [dict(gid=r[0], summary=r[1], untried=r[2], harmonic=r[3]) for r in rows]
 
 
 def mine_sequences(store: GraphStore, key: str, min_freq: int = 2, limit: int = 10) -> list[dict]:

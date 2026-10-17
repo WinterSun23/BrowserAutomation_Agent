@@ -45,7 +45,7 @@ def discard_shot(ctx: ToolContext, args: dict):
 
 
 def set_caption(ctx: ToolContext, args: dict):
-    _demo(ctx).set_caption(int(args["shot_id"]), args["caption"])
+    _demo(ctx).set_caption(int(args["shot_id"]), args["caption"], args.get("narration"))
     return {"shot_id": args["shot_id"], "caption": args["caption"][:120]}
 
 
@@ -58,7 +58,7 @@ def compose_storyboard(ctx: ToolContext, args: dict):
 
 
 def render(ctx: ToolContext, args: dict):
-    return _demo(ctx).render(list(args["formats"]))
+    return _demo(ctx).render(list(args["formats"]), bool(args.get("narration")))
 
 
 def register(box: Toolbox) -> None:
@@ -83,7 +83,8 @@ def register(box: Toolbox) -> None:
     box.register(ToolSpec("discard_shot", "Drop a bad shot from the demo (then capture it again).",
                           {"type": "object", "properties": sid, "required": ["shot_id"]}, discard_shot, "act"))
     box.register(ToolSpec("set_caption", "Change a shot's on-screen caption (12 words or fewer).",
-                          {"type": "object", "properties": {**sid, "caption": {"type": "string"}},
+                          {"type": "object", "properties": {**sid, "caption": {"type": "string"},
+                                                          "narration": {"type": "string"}},
                            "required": ["shot_id", "caption"]}, set_caption, "act"))
     box.register(ToolSpec("list_shots", "List the shots recorded so far.", {"type": "object", "properties": {}},
                           list_shots, "read"))
@@ -95,4 +96,5 @@ def register(box: Toolbox) -> None:
     box.register(ToolSpec(
         "render", "FINAL STEP: stop recording and render the storyboard in the given formats "
         "(video, gif, screenshot, guide, clickthrough).", {"type": "object", "properties": {
-            "formats": {"type": "array", "items": {"type": "string"}}}, "required": ["formats"]}, render, "act"))
+            "formats": {"type": "array", "items": {"type": "string"}},
+            "narration": {"type": "boolean"}}, "required": ["formats"]}, render, "act"))

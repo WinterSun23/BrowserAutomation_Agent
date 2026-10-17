@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ..embed import cosine
+
 from itertools import combinations
 
 from ..capture.segment import jaccard
@@ -107,14 +109,27 @@ class Curator:
     # ---------- algorithms ----------
     def run_algorithms(self) -> None:
         if not self.ro("MATCH ()-[r:ACTION]->() RETURN count(r)")[0][0]:
-            self.q("MATCH (s:State) SET s.pagerank = 0.0, s.betweenness = 0.0, s.community = 0")
+            self.q("MATCH (s:State) SET s.pagerank = 0.0, s.betweenness = 0.0, s.community = 0, s.harmonic = 0.0")
             return
         self.q("CALL algo.pageRank('State', 'ACTION') YIELD node, score SET node.pagerank = score")
         self.q("CALL algo.betweenness({nodeLabels:['State'], relationshipTypes:['ACTION'], samplingSize:64, "
                "samplingSeed:42}) YIELD node, score SET node.betweenness = score")
         self.q("CALL algo.labelPropagation({nodeLabels:['State'], relationshipTypes:['ACTION'], maxIterations:20}) "
                "YIELD node, communityId SET node.community = communityId")
+        # how central a screen is by distance to all others; screens with no way out; screens the entry cannot reach
+        self.q("CALL algo.HarmonicCentrality({nodeLabels:['State'], relationshipTypes:['ACTION']}) "
+               "YIELD node, score SET node.harmonic = score")
+        self.q("MATCH (s:State) WHERE NOT (s)-[:ACTION]->() SET s:DeadEnd")
+        self.q("MATCH (s:State:DeadEnd) WHERE (s)-[:ACTION]->() REMOVE s:DeadEnd")
+        comps = dict(self.ro("CALL algo.WCC({nodeLabels:['State'], relationshipTypes:['ACTION']}) "
+                             "YIELD node, componentId RETURN node.gid, componentId"))
+        entry = self.ro("MATCH (s:State:Entry) RETURN s.gid LIMIT 1")
+        if entry and comps:
+            ec = comps.get(entry[0][0])
+            self.q("UNWIND $rows AS r MATCH (s:State {gid:r.g}) SET s.reachable = r.ok",
+                   rows=[{"g": g, "ok": c == ec} for g, c in comps.items()])
         self.q("MATCH (s:State) WHERE s.pagerank IS NULL SET s.pagerank = 0.0, s.betweenness = 0.0, s.community = -1")
+        self.q("MATCH (s:State) WHERE s.harmonic IS NULL SET s.harmonic = 0.0")
 
     def build_features(self) -> int:
         rows = self.ro("MATCH (s:State) RETURN s.community, collect([s.gid, coalesce(s.pagerank, 0.0), "
@@ -220,11 +235,69 @@ class Curator:
                         "reliability": round(rel, 2), "from": src[:80], "to": dst[:80]})
         return out[:self.MAX_FINDINGS]
 
+    # ---------- workflow intelligence ----------
+    def link_workflows(self, window_ms: int = 1_800_000) -> None:
+        """FOLLOWED_BY between workflows that ran one after the other within the window (with a count)."""
+        rows = self.ro("MATCH (r:Run)-[:EXECUTED]->(w:Workflow) RETURN w.gid, r.started ORDER BY r.started")
+        counts: dict[tuple[str, str], int] = {}
+        for (a, ta), (b, tb) in zip(rows, rows[1:]):
+            if a != b and tb is not None and ta is not None and tb - ta <= window_ms:
+                counts[(a, b)] = counts.get((a, b), 0) + 1
+        self.q("MATCH (:Workflow)-[f:FOLLOWED_BY]->(:Workflow) DELETE f")
+        for (a, b), n in counts.items():
+            self.q("MATCH (a:Workflow {gid:$a}), (b:Workflow {gid:$b}) CREATE (a)-[:FOLLOWED_BY {count:$n}]->(b)",
+                   a=a, b=b, n=n)
+
+    def similar_workflows(self, k: int = 5) -> None:
+        self.q("MATCH (:Workflow)-[s:SIMILAR_TO]->(:Workflow) DELETE s")
+        for g, emb in self.ro("MATCH (w:Workflow) WHERE w.emb IS NOT NULL RETURN w.gid, w.emb"):
+            rows = self.ro("CALL db.idx.vector.queryNodes('Workflow', 'emb', $k, vecf32($v)) YIELD node "
+                           "RETURN node.gid, node.emb", k=k + 1, v=list(emb))
+            for og, oemb in rows:
+                sim = cosine(list(emb), list(oemb))
+                if og != g and sim >= self.s.workflow_similar:
+                    self.q("MATCH (a:Workflow {gid:$a}), (b:Workflow {gid:$b}) MERGE (a)-[s:SIMILAR_TO]->(b) "
+                           "SET s.score = $s", a=g, b=og, s=sim)
+
+    def workflow_rank(self) -> None:
+        """PageRank over FOLLOWED_BY: which workflows tend to lead to others."""
+        if self.ro("MATCH (:Workflow)-[f:FOLLOWED_BY]->(:Workflow) RETURN count(f)")[0][0]:
+            self.q("CALL algo.pageRank('Workflow', 'FOLLOWED_BY') YIELD node, score SET node.pagerank = score")
+        self.q("MATCH (w:Workflow) WHERE w.pagerank IS NULL SET w.pagerank = 0.0")
+
+    def dedupe_intents(self) -> int:
+        """Merge intents that mean the same thing (embedding similarity), keeping the most used; sums their hits."""
+        merged = 0
+        rows = self.ro("MATCH (i:Intent) WHERE i.emb IS NOT NULL RETURN i.gid, i.emb, coalesce(i.hits, 0) "
+                       "ORDER BY coalesce(i.hits, 0) DESC")
+        gone: set[str] = set()
+        for g, emb, _ in rows:
+            if g in gone:
+                continue
+            for og, oemb in self.ro("CALL db.idx.vector.queryNodes('Intent', 'emb', 5, vecf32($v)) YIELD node "
+                                    "RETURN node.gid, node.emb", v=list(emb)):
+                if og == g or og in gone or cosine(list(emb), list(oemb)) < self.s.intent_dedupe:
+                    continue
+                self.q("""MATCH (dup:Intent {gid:$d})-[f:FULFILLED_BY]->(t), (keep:Intent {gid:$k})
+                          MERGE (keep)-[nf:FULFILLED_BY]->(t) SET nf.score = coalesce(nf.score, f.score)""", d=og, k=g)
+                self.q("MATCH (dup:Intent {gid:$d}), (keep:Intent {gid:$k}) "
+                       "SET keep.hits = coalesce(keep.hits, 0) + coalesce(dup.hits, 0) DETACH DELETE dup", d=og, k=g)
+                gone.add(og)
+                merged += 1
+        return merged
+
+    def workflow_intelligence(self) -> None:
+        self.link_workflows()
+        self.similar_workflows()
+        self.workflow_rank()
+        self.dedupe_intents()
+
     def run_all(self, max_risk_cost: int, escalate=None) -> dict:
         annotated = self.annotate()
         self.run_algorithms()
         features = self.build_features()
         self.compute_demo_scores()
+        self.workflow_intelligence()
         self.refresh_frontiers(max_risk_cost)
         deleted = self.apply_retention()
         stats = {"annotated": annotated, "features": features, "runs_deleted": deleted}

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import base64
 import html
+import io
 import json
 import shutil
 import subprocess
+import zipfile
 from pathlib import Path
 
 
@@ -85,3 +87,15 @@ function show(){{const s=S[i];img.src=s.img;cap.textContent=(i+1)+'/'+S.length+'
 if(s.hs){{hs.hidden=false;Object.assign(hs.style,{{left:s.hs[0]+'%',top:s.hs[1]+'%',width:s.hs[2]+'%',height:s.hs[3]+'%'}});}}
 else hs.hidden=true;next.textContent=i===S.length-1?'Restart':'Next';}}
 function go(){{i=(i+1)%S.length;show();}}hs.onclick=go;next.onclick=go;show();</script></body></html>"""
+
+
+def render_guide_markdown(title: str, slides: list[tuple[str, bytes, list | None]]) -> bytes:
+    """A zip with guide.md and images/step-N.png: a step-by-step guide that can go straight into docs or a wiki."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        lines = [f"# {title}", ""]
+        for i, (cap, png, _) in enumerate(slides, 1):
+            z.writestr(f"images/step-{i}.png", png)
+            lines += [f"{i}. {cap}", "", f"   ![Step {i}](images/step-{i}.png)", ""]
+        z.writestr("guide.md", "\n".join(lines))
+    return buf.getvalue()

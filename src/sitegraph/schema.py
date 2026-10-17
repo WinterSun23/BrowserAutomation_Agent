@@ -90,3 +90,17 @@ def ensure_profile_schema(store: GraphStore, key: str, dim: int = 384) -> None:
         _exact(store, key, have, label, prop)
     for label in _PROFILE_VECTOR:
         _vector(store, key, have, label, dim)
+
+
+_SEMANTIC_EXACT = ["UIPattern", "FlowPattern", "StepPattern", "SiteRef", "LogicalState", "ComponentRef",
+                   "DeviceStateRef", "WorkflowRef"]
+_SEMANTIC_VECTOR = ["UIPattern", "FlowPattern", "StepPattern", "LogicalState"]
+
+
+def ensure_semantic_schema(store: GraphStore, key: str, dim: int = 384) -> None:
+    store.query(key, "RETURN 1")
+    have = _existing(store, key)
+    for label in _SEMANTIC_EXACT:
+        _exact(store, key, have, label, "gid")
+    for label in _SEMANTIC_VECTOR:
+        _vector(store, key, have, label, dim)

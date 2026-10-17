@@ -15,5 +15,18 @@ window.__sg = {
     this.ensure(); const e = document.getElementById('__sg_hl');
     Object.assign(e.style, { left: (x - 6) + 'px', top: (y - 6) + 'px', width: (w + 12) + 'px', height: (h + 12) + 'px', display: 'block' });
   },
-  clear() { ['__sg_cap', '__sg_hl'].forEach(id => { const e = document.getElementById(id); if (e) e.style.display = 'none'; }); },
+  cursor(x, y) {
+    let c = document.getElementById('__sg_cur');
+    if (!c) { c = document.createElement('div'); c.id = '__sg_cur';
+      c.style.cssText = 'position:fixed;width:18px;height:18px;border-radius:50%;background:rgba(255,61,113,.9);' +
+        'box-shadow:0 0 0 6px rgba(255,61,113,.25);z-index:2147483647;pointer-events:none;transition:all .5s ease;left:0;top:0';
+      document.documentElement.append(c); }
+    c.style.left = (x - 9) + 'px'; c.style.top = (y - 9) + 'px'; c.style.display = 'block';
+  },
+  zoom(x, y, s) {
+    const d = document.documentElement;
+    d.style.transition = 'transform .4s ease'; d.style.transformOrigin = `${x}px ${y}px`; d.style.transform = `scale(${s})`;
+  },
+  unzoom() { const d = document.documentElement; d.style.transform = ''; d.style.transformOrigin = ''; },
+  clear() { ['__sg_cap', '__sg_hl', '__sg_cur'].forEach(id => { const e = document.getElementById(id); if (e) e.style.display = 'none'; }); },
 };

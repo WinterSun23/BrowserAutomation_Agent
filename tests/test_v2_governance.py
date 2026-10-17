@@ -40,6 +40,7 @@ def built(store, msettings, site_url, tmp_path_factory):
         nav = Navigator(store, key, domain, s, msettings, HashEmbedder(), blobs=blobs)
         nav.explore(site_url + "/index.html", ExplorationPolicy(max_depth=2))
         Curator(store, key, msettings, HashEmbedder(), FakeLLM(site_responder)).run_all(1)
+        s.goto(site_url + "/index.html")         # exploring may end on the cart page: "open cart" would record no step
         res = nav.execute_goal("open cart")
     from sitegraph.agents.workflows import save_workflow_from_run
     wf = save_workflow_from_run(store, key, HashEmbedder(), res.run_gid, "cart", "open my shopping cart")

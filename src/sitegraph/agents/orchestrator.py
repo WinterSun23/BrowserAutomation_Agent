@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -17,6 +18,8 @@ from ..normalize import domain_of
 from ..ops import Ops
 from ..profile import SENSITIVE_TEXT, Profile
 from ..schema import ensure_device_schema
+from ..semantic.distiller import Distiller, semantic_key
+from ..semantic.uses import exploration_priority
 from ..versions import ALGO_VERSION
 from .curator import Curator
 from .escalation import make_curator_escalation, make_escalation
@@ -90,6 +93,31 @@ class Orchestrator:
             ops.register_agent(agent, role, device if role in ("planner", "executor", "explorer") else None)
         return info
 
+    def register_devices(self, url: str, devices: list[str]) -> list[SiteInfo]:
+        return [self.register_site(url, d) for d in devices]
+
+    def run_multi(self, parent_id: str, text: str, sites: list[SiteInfo]) -> dict:
+        """One request on every device at once. The parent task has one subtask per device; the Navigator budget is
+        split between the devices (each device would otherwise start `navigators_per_site` browsers of its own)."""
+        ops = Ops(self.store, self.s.uid, sites[0].domain)
+        ops.set_status(parent_id, "running")
+        kids = [ops.create_task("chat", text, device=s.device, parent=parent_id) for s in sites]
+        share = max(1, self.s.navigators_per_site // len(sites))
+        with ThreadPoolExecutor(max_workers=len(sites)) as ex:
+            results = list(ex.map(lambda pair: self.run_task(pair[0], text, pair[1], navigators=share),
+                                  zip(kids, sites)))
+        agg = {"kind": "multi", "devices": {s.device: r for s, r in zip(sites, results)}}
+        status = "done" if all(r.get("kind") != "error" for r in results) else "failed"
+        ops.set_status(parent_id, status, agg)
+        self.events.publish(self.s.uid, {"type": "task", "task": parent_id, "status": status, "result": agg})
+        return agg
+
+    def submit_multi(self, text: str, domain: str, devices: list[str]) -> str:
+        sites = [self.site(domain, d) for d in devices]
+        pid = Ops(self.store, self.s.uid, domain).create_task("multi", text)
+        threading.Thread(target=self.run_multi, args=(pid, text, sites), daemon=True).start()
+        return pid
+
     def site(self, domain: str, device: str = "desktop") -> SiteInfo:
         for s in self.profile.sites():
             if s["domain"] == domain and s["device"] == device:
@@ -134,6 +162,9 @@ class Orchestrator:
         git = GitOps(self.store, self.s.uid, site.domain, self.s)
         ops, scope = Ops(self.store, self.s.uid, site.domain), ulid("scope")
         agents = [f"explorer-{site.device}-{i}" for i in range(n)]
+        # on a site/device pair with a semantic graph behind it, look first at what resembles known important flows
+        prioritize = (exploration_priority(self.store, self.s.uid, self.embedder)
+                      if self.store.exists(semantic_key(self.s.uid)) else None)
 
         def worker(agent: str):
             br = git.fork(site.device, agent, task_id)
@@ -146,7 +177,8 @@ class Orchestrator:
                                          blobs=self.blobs, events=self.events, agent_id=agent, task_id=task_id,
                                          writer=writer, secrets=lambda var: self.profile.secret_for(var, site.domain),
                                          notes=self._note_fn(site, agent))
-                    rep = nav.explore(seeds or site.entry_url, policy, scope=scope, work_key=site.key)
+                    rep = nav.explore(seeds or site.entry_url, policy, scope=scope, work_key=site.key,
+                                      prioritize=prioritize)
                 commit = git.commit(br, writer, agent, f"explore {site.domain}: {len(rep.states)} states, "
                                                        f"{rep.actions} actions")
                 return br, rep, commit
@@ -187,6 +219,9 @@ class Orchestrator:
                 "per_agent": [{"agent": b.owner, "states": len(r.states), "actions": r.actions, "pages": r.pages,
                                "commit": c} for b, r, c in outs], "failed_agents": [str(e)[:200] for e in errors],
                 **stats}
+
+    def rebuild_semantic(self) -> dict:
+        return Distiller(self.store, self.s.uid, self.embedder, self.llm, self.s, self.profile).rebuild()
 
     def explore_parallel(self, site: SiteInfo, policy, task_id: str, n: int = 2) -> dict:
         """Explore again with n branches, seeded with the entry page and the most promising unexplored screens."""
@@ -350,7 +385,11 @@ class Orchestrator:
         return str(ans.get("answer") if isinstance(ans, dict) else ans)
 
     def recommend(self, site: SiteInfo) -> dict:
-        return recommendations(self.store, site.key, self.profile.policy_for(site.domain, site.device).max_risk_cost)
+        recs = recommendations(self.store, site.key, self.profile.policy_for(site.domain, site.device).max_risk_cost)
+        nxt = self.store.ro_query(site.key, """MATCH (w:Workflow)
+            RETURN w.gid, w.name, coalesce(w.pagerank, 0.0) + 0.01 * coalesce(w.run_count, 0) AS r
+            ORDER BY r DESC LIMIT 5""")
+        return {**recs, "next_workflows": [{"gid": g, "name": nm, "rank": r} for g, nm, r in nxt]}
 
     def close(self) -> None:
         self.profile.end_session(self.session_id, self.llm)

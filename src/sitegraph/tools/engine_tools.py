@@ -12,6 +12,7 @@ from ..agents.demo_agent import DemoAgent
 from ..events import NullEvents
 from ..git import GitOps
 from ..graph.queries import entry_state
+from ..ops import Ops
 from ..normalize import normalize_text
 from ..profile import SENSITIVE_TEXT
 from .browser_tools import get_nav
@@ -103,6 +104,20 @@ def _explore(ctx: ToolContext, args: dict):
             "blocked_as_risky": rep.blocked, "navigators": n, "agents": agents, **stats}
 
 
+def _run_on_devices(ctx: ToolContext, args: dict):
+    """The same request on several devices at once (phone / tablet / desktop), tracked as one parent task."""
+    devices = list(dict.fromkeys(args["devices"]))
+    entry = args.get("entry_url") or (entry_state(ctx.store, ctx.key) or [None, None])[1]
+    if not entry:
+        raise ValueError("no entry_url given and the site has not been explored before")
+    orch = Orchestrator(ctx.settings, ctx.store, ctx.embedder, ctx.llm, ctx.blobs, NullEvents())
+    sites = orch.register_devices(entry, devices)
+    parent = Ops(ctx.store, ctx.settings.uid, ctx.domain).create_task("multi", args["text"])
+    res = orch.run_multi(parent, args["text"], sites)
+    return {"task": parent, "devices": {d: {k: v for k, v in r.items() if k in (
+        "kind", "status", "states", "actions", "navigators", "explanation", "error")} for d, r in res["devices"].items()}}
+
+
 def _make_demo(ctx: ToolContext, args: dict):
     """Hand the request to the Demo agent (or, without a tool-calling model, the fixed pipeline). The agent may ask a
     clarifying question: the chat then ends its turn with it, and the answer comes back here as `reply`."""
@@ -182,6 +197,13 @@ def register(box: Toolbox) -> None:
         {"type": "object", "properties": {"entry_url": {"type": "string"}, "navigators": {"type": "integer",
                                                                                          "minimum": 1}}},
         _explore, "act"))
+    box.register(ToolSpec(
+        "run_on_devices", "Run one request (for example 'explore the site') on several devices at once, each with its "
+        "own map: desktop, tablet, phone. The browsers allowed by the configuration are split between the devices.",
+        {"type": "object", "properties": {"text": {"type": "string"}, "entry_url": {"type": "string"},
+                                          "devices": {"type": "array", "minItems": 1, "items": {
+                                              "type": "string", "enum": ["desktop", "tablet", "phone"]}}},
+         "required": ["text", "devices"]}, _run_on_devices, "act"))
     box.register(ToolSpec(
         "make_demo", "Record and render a demo of something on the site (video, gif, screenshot, step guide, "
         "click-through) from a plain-language request. If it returns a question, ask the user and call make_demo again "

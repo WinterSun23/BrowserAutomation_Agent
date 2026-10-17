@@ -5,8 +5,8 @@ from dataclasses import dataclass
 
 from ..llm import complete_json
 
-FORMATS = ["video", "guide", "clickthrough", "gif", "screenshot"]
-SCOPES = ["workflow", "goal", "state", "transition", "feature"]
+FORMATS = ["video", "guide", "guide_md", "clickthrough", "gif", "screenshot"]
+SCOPES = ["workflow", "goal", "state", "transition", "feature", "highlights"]
 _SYSTEM = "You turn a user's request into a capture plan for a website demo agent."
 
 
@@ -17,6 +17,7 @@ class DemoSpec:
     target: str
     audience: str = "general"
     max_seconds: int = 60
+    narration: bool = False        # a spoken voiceover (offline text-to-speech)
 
 
 _FORMAT_WORDS = [("gif", "gif"), ("screenshot", "screenshot"), ("screen shot", "screenshot"),
@@ -44,8 +45,10 @@ def interpret(llm, text: str, prefs: dict | None = None, memories: list | None =
                          f"Relevant memories: {memories or []}\n"
                          f"Return JSON with keys: formats (subset of {FORMATS}), scope_kind (one of {SCOPES}; "
                          "workflow=a saved automation, goal=how to reach something, state=one screen, "
-                         "transition=a small interaction like opening a menu, feature=an area of the site), "
-                         "target (short description of what to show), audience, max_seconds.", default=default)
+                         "transition=a small interaction like opening a menu, feature=an area of the site, "
+                         "highlights=the site's most important flows), "
+                         "target (short description of what to show), audience, max_seconds, narration (true if the user wants a "
+                         "voiceover).", default=default)
     if not isinstance(data, dict):
         data = default
     formats = [f for f in data.get("formats") or [] if f in FORMATS] or default["formats"]
@@ -55,4 +58,5 @@ def interpret(llm, text: str, prefs: dict | None = None, memories: list | None =
     except (TypeError, ValueError):
         seconds = 60
     return DemoSpec(formats=formats, scope_kind=scope, target=str(data.get("target") or text),
-                    audience=str(data.get("audience") or "general"), max_seconds=seconds)
+                    audience=str(data.get("audience") or "general"), max_seconds=seconds,
+                    narration=bool(data.get("narration")))

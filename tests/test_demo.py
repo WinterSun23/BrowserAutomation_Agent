@@ -55,7 +55,8 @@ def test_director_produces_renders(world, interp):
     store, settings, key, domain, blobs = world
     d = DemoDirector(store, key, domain, settings, HashEmbedder(), FakeLLM(_responder(interp)), blobs)
     res = d.run("make a demo")
-    assert {f for f, _ in res.renders} == set(interp["formats"])
+    expected = set(interp["formats"]) | ({"guide_md"} if "guide" in interp["formats"] else set())   # a guide also comes as Markdown
+    assert {f for f, _ in res.renders} == expected
     for _, ref in res.renders:
         assert blobs.path(ref).stat().st_size > 0
     rows = store.ro_query(key, "MATCH (:Storyboard {gid:$g})-[:RENDERED_AS]->(r:Render) RETURN r.status",

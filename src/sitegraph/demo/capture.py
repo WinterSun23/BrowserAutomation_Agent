@@ -61,13 +61,17 @@ class DemoSession:
         self.result.run_gid = self.run
         self.cur = self.nav.current_state()[0]
 
-    def _overlay(self, caption: str | None, box: dict | None) -> None:
+    def _overlay(self, caption: str | None, box: dict | None, zoom: bool = False) -> None:
         page = self.sess.page
         try:
             page.evaluate("t => window.__sg && window.__sg.caption(t)", caption or "")
             if box:
+                cx, cy = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
                 page.evaluate("b => window.__sg && window.__sg.highlight(b[0], b[1], b[2], b[3])",
                               [box["x"], box["y"], box["width"], box["height"]])
+                page.evaluate("p => window.__sg && window.__sg.cursor(p[0], p[1])", [cx, cy])
+                if zoom:
+                    page.evaluate("p => window.__sg && window.__sg.zoom(p[0], p[1], 1.35)", [cx, cy])
         except Exception:
             pass
 
@@ -80,9 +84,15 @@ class DemoSession:
             box = loc.locator.bounding_box() if loc else None
         self._overlay(shot.caption, box)
         self.sess.page.wait_for_timeout(wait_ms)
-        result.keyframes[shot.i] = self.sess.screenshot_png()
+        result.keyframes[shot.i] = self.sess.screenshot_png()         # taken before zooming, so the box still matches
         if box:
             result.hotspots[shot.i] = [box["x"], box["y"], box["width"], box["height"]]
+            self._overlay(shot.caption, box, zoom=True)
+            self.sess.page.wait_for_timeout(700)
+            try:
+                self.sess.page.evaluate("() => window.__sg && window.__sg.unzoom()")   # the action itself is unzoomed
+            except Exception:
+                pass
 
     def record(self, shot: ShotPlan) -> None:
         """Record one shot: highlight, keyframe, then perform its action in the browser."""
