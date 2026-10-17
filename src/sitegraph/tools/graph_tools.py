@@ -17,7 +17,17 @@ def _obj(**props) -> dict:
 def find_screens(ctx: ToolContext, args: dict):
     vec = ctx.embedder.embed([args["query"]])[0]
     hits = find_targets(ctx.store, ctx.key, vec, int(args.get("k", 5)), text=args["query"])
-    return [{"kind": t.kind, "gid": t.gid, "description": t.text, "score": round(t.score, 3)} for t in hits]
+    out = []
+    for t in hits:
+        hit = {"kind": t.kind, "gid": t.gid, "description": t.text, "score": round(t.score, 3)}
+        if t.item:
+            # one state stands for every entry of a list and carries the name of whichever entry was seen last
+            hit["item"] = t.item
+            hit["description"] = (f"Shared page type reached by choosing '{t.item}' from a list (its stored name "
+                                  f"'{t.text}' belongs to another entry of the same type). To open it: run_goal with "
+                                  f"goal '{args['query']}' and item '{t.item}'.")
+        out.append(hit)
+    return out
 
 
 def plan_route(ctx: ToolContext, args: dict):
@@ -64,7 +74,9 @@ def list_workflows(ctx: ToolContext, args: dict):
 def register(box: Toolbox) -> None:
     box.register(ToolSpec(
         "find_screens", "Search the known site map for screens (or saved workflows) matching a description or a name "
-        "(for example 'shopping cart', or an item name such as 'Mystery'). Returns candidates with gids and scores.",
+        "(for example 'shopping cart', or an item name such as 'Mystery'). Returns candidates with gids and scores. A "
+        "candidate with `item` is a shared page type (one screen for every entry of a list): open it with run_goal "
+        "and that `item`.",
         {"type": "object", "properties": {"query": {"type": "string"}, "k": {"type": "integer", "minimum": 1,
                                                                              "maximum": 10}},
          "required": ["query"]}, find_screens, "read", untrusted_output=True))

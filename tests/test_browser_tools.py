@@ -162,6 +162,17 @@ def test_run_goal_then_save_workflow(box, shop):
     assert {"next_actions", "frontier", "demo_candidates"} <= set(box.call("recommend", {}).data)
 
 
+def test_run_goal_says_when_the_goal_needs_an_approved_action(box, shop):
+    res = box.call("run_goal", {"goal": "go to checkout"})
+    assert res.ok and res.data["url"].endswith("/cart.html")                  # the nearest allowed screen
+    assert res.data["status"] == "stopped_short" and res.data["goal_reached"] is False
+    assert res.data["blocked_by"]["element"] == "Checkout" and res.data["blocked_by"]["risk"] == "submit_mutating"
+    assert "approval" in res.data["next_step"] and "not reached" in res.data["next_step"]
+    assert box.ctx.browser().page.url.endswith("/cart.html")                  # nothing risky was clicked
+    plain = box.call("run_goal", {"goal": "open cart"})                       # a goal that names no risky element
+    assert plain.data["status"] == "done" and "blocked_by" not in plain.data
+
+
 def test_save_workflow_needs_a_run_first(box):
     r = box.call("save_workflow", {"name": "x", "goal": "y"})
     assert not r.ok and "run_goal" in r.error

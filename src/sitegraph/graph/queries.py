@@ -15,6 +15,7 @@ class Target:
     gid: str
     text: str
     score: float
+    item: str | None = None   # set when the target was found through a list item the request names ('Travel')
 
 
 @dataclass
@@ -53,11 +54,12 @@ def _targets_from_list_items(store: GraphStore, key: str, text: str) -> list[Tar
     rows = store.ro_query(key, "MATCH (e:Element {is_template:true}) WHERE e.sample_items IS NOT NULL "
                                "RETURN e.gid, e.sample_items")
     for el_gid, items in rows:
-        if pick_by_text(list(items), text) is None:
+        item = pick_by_text(list(items), text)
+        if item is None:
             continue
         for g, summary in store.ro_query(key, "MATCH (:State)-[r:ACTION {el_gid:$e}]->(t:State) "
                                               "RETURN DISTINCT t.gid, coalesce(t.summary, '')", {"e": el_gid}):
-            out.append(Target("State", g, summary, ITEM_TARGET_SCORE))
+            out.append(Target("State", g, summary, ITEM_TARGET_SCORE, item))
     return out
 
 
@@ -74,11 +76,11 @@ def find_targets(store: GraphStore, key: str, vec: list[float], k: int = 5, text
     for label, g, text, emb, fscore in rows:
         score = cosine(vec, list(emb)) * fscore
         if g not in out or out[g].score < score:
-            out[g] = Target(label, g, text or "", score)
+            out[g] = Target(label, g, text or "", score, out[g].item if g in out else None)
     for label in ("Workflow", "State"):
         for g, text, sim in find_nodes(store, key, label, vec, k, "summary" if label == "State" else "name"):
             if g not in out or out[g].score < sim:
-                out[g] = Target(label, g, text, sim)
+                out[g] = Target(label, g, text, sim, out[g].item if g in out else None)
     return sorted(out.values(), key=lambda t: t.score, reverse=True)[:k]
 
 

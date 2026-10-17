@@ -94,3 +94,17 @@ def test_without_any_hint_the_first_item_is_used(shop):
         res = _nav(shop, s).execute_goal("open a category")                    # nothing to choose by, offline
         assert res.status == "done", res.explanation
         assert s.url.endswith("/category.html?name=travel")
+
+
+def test_find_screens_names_the_list_item_and_how_to_reach_it(shop):
+    """The shared category state is named after whichever category was seen last; find_screens must not let that
+    name hide the entry the request asked for (an agent read 'Poetry' and concluded Travel did not exist)."""
+    from sitegraph.tools import ToolContext, build_toolbox
+
+    store, settings, key, domain, _ = shop
+    ctx = ToolContext(settings=settings, store=store, key=key, domain=domain, embedder=HashEmbedder(), llm=OfflineLLM())
+    hits = build_toolbox(ctx).call("find_screens", {"query": "take me to the travel category"})
+    top = hits.data[0]
+    assert top["item"] == "Travel"
+    assert "'Travel'" in top["description"] and "run_goal" in top["description"] and "item" in top["description"]
+    assert all("item" not in h for h in hits.data[1:] if h["gid"] != top["gid"])   # ordinary hits stay as they were

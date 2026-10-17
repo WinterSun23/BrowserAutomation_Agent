@@ -11,6 +11,7 @@ from ..db import ops_key
 from ..agents.demo_agent import DemoAgent
 from ..events import NullEvents
 from ..graph.queries import entry_state
+from ..normalize import normalize_text
 from .browser_tools import get_nav
 from .core import ToolContext, ToolResult, ToolSpec, Toolbox
 from .graph_tools import policy_of
@@ -20,13 +21,41 @@ _SENSITIVE_MEMORY = re.compile(
     re.I)
 
 
+def _risky_element_named_in(ctx: ToolContext, goal: str) -> dict | None:
+    """A known element above the allowed risk level whose name the goal mentions ('go to checkout' -> the 'Checkout'
+    button), with the states that show it. Whole-word match, so paraphrases are not caught."""
+    want = f" {normalize_text(goal)} "
+    rows = ctx.store.ro_query(ctx.key, """
+        MATCH (s:State)-[:COMPOSED_OF]->(:ComponentState)-[:CONTAINS]->(x:Element) WHERE x.risk_cost > $mrc
+        RETURN x.name_sample, x.name_norm, x.risk, collect(DISTINCT s.gid)""", {"mrc": policy_of(ctx).max_risk_cost})
+    hits = [r for r in rows if r[1] and len(r[1]) >= 3 and f" {r[1]} " in want]
+    if not hits:
+        return None
+    name, norm, risk, states = max(hits, key=lambda r: len(r[1]))
+    return {"element": name, "risk": risk, "states": states}
+
+
 def _run_goal(ctx: ToolContext, args: dict):
     nav = get_nav(ctx)
-    res = nav.execute_goal(args["goal"], {}, policy_of(ctx), args.get("item"), request_text=args["goal"])
+    policy = policy_of(ctx)
+    res = nav.execute_goal(args["goal"], {}, policy, args.get("item"), request_text=args["goal"])
     ctx.extra["last_run"] = res.run_gid
     ctx.extra.pop("elements", None)
-    return {"status": res.status, "explanation": res.explanation, "url": nav.session.url, "heals": res.heals,
-            "replans": res.replans}
+    out = {"status": res.status, "explanation": res.explanation, "url": nav.session.url, "heals": res.heals,
+           "replans": res.replans}
+    risky = _risky_element_named_in(ctx, args["goal"])
+    if risky is None or (res.status == "done" and res.landed not in risky["states"]):
+        return out                                            # nothing risky named, or the goal itself was reached
+    if res.landed not in risky["states"]:                     # get as close as allowed: the screen with that element
+        run = nav.activity.start_run("execute", "chat-agent", request=f"approach {risky['element']}")
+        status, _, _, _, _ = nav.drive_to(risky["states"][0], run, [0], {}, policy)
+        nav.activity.finish_run(run, status)
+    return {"status": "stopped_short", "goal_reached": False, "route_status": res.status, "url": nav.session.url,
+            "blocked_by": {"element": risky["element"], "risk": risky["risk"]},
+            "next_step": (f"The goal was not reached. It needs '{risky['element']}' ({risky['risk']}), which is above "
+                          f"the allowed risk level, so it was not done. Tell the user plainly that the goal was not "
+                          f"reached and that this step needs their approval; to go on, observe and click "
+                          f"'{risky['element']}' (the click asks the user to approve it).")}
 
 
 def _run_route(ctx: ToolContext, args: dict):
@@ -134,7 +163,8 @@ def register(box: Toolbox) -> None:
     box.register(ToolSpec(
         "run_goal", "Use the saved site map to take the browser to a screen described in words, e.g. 'the Mystery "
         "category' or 'shopping cart'. Plans a safe route, runs it and repairs broken steps itself. Pass `item` to pick "
-        "an entry of a repeated list. Cheaper and more reliable than clicking by hand when the screen is known.",
+        "an entry of a repeated list. Cheaper and more reliable than clicking by hand when the screen is known. "
+        "status 'stopped_short' means the goal was NOT reached because it needs a risky action: follow next_step.",
         {"type": "object", "properties": {"goal": {"type": "string"}, "item": {"type": "string"}},
          "required": ["goal"]}, _run_goal, "act", untrusted_output=True))
     box.register(ToolSpec(
