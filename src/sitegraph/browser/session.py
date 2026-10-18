@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from importlib.resources import files
 from pathlib import Path
@@ -35,7 +36,9 @@ class BrowserSession:
 
     def __enter__(self) -> "BrowserSession":
         self._pw = sync_playwright().start()
-        self.browser = self._pw.chromium.launch(headless=self.headless)
+        # an installed browser ("chrome", "msedge") instead of Playwright's own Chromium, when set
+        channel = os.environ.get("SITEGRAPH_BROWSER_CHANNEL") or None
+        self.browser = self._pw.chromium.launch(headless=self.headless, channel=channel)
         args: dict = dict(self._pw.devices[_DEVICES[self.device]]) if self.device in _DEVICES else \
             {"viewport": {"width": 1280, "height": 720}}
         args.pop("default_browser_type", None)  # a device-descriptor field that new_context() does not accept
