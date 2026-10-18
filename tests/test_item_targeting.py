@@ -108,3 +108,23 @@ def test_find_screens_names_the_list_item_and_how_to_reach_it(shop):
     assert top["item"] == "Travel"
     assert "'Travel'" in top["description"] and "run_goal" in top["description"] and "item" in top["description"]
     assert all("item" not in h for h in hits.data[1:] if h["gid"] != top["gid"])   # ordinary hits stay as they were
+
+
+def test_demo_captions_and_summaries_name_the_item_not_the_shared_types_stored_name(shop):
+    """The demo's final caption used to read 'Poetry | ...' over the Travel page: name the chosen entry instead, and
+    say a shared page type's stored name is just the entry seen last wherever it is listed without an item."""
+    from sitegraph.demo.spec import DemoSpec
+    from sitegraph.demo.storyboard import StoryboardBuilder
+    from sitegraph.graph.queries import entry_state, frontier_states, next_actions
+
+    store, settings, key, _, _ = shop
+    sb = StoryboardBuilder(store, key, HashEmbedder(), OfflineLLM()).build(
+        DemoSpec(formats=["gif"], scope_kind="goal", target="the mystery category"), "a gif of the mystery category")
+    assert sb.shots[-1].kind == "still" and sb.shots[-1].caption == "Mystery"
+
+    shared = store.ro_query(key, "MATCH (:Page {url_template:'/category.html?name'})-[:HAS_STATE]->(s:State) "
+                                 "RETURN s.gid")[0][0]
+    acts = [a for a in next_actions(store, key, entry_state(store, key)[0], 5, 10) if a["target"] == shared]
+    assert acts and all(a["target_summary"].startswith("Shared page type") for a in acts)
+    assert all(f["summary"].startswith("Shared page type") for f in frontier_states(store, key, limit=50)
+               if f["gid"] == shared)

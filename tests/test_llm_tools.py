@@ -66,6 +66,24 @@ def test_litellm_client_chat_passes_tools_and_attaches_image(monkeypatch):
     assert last["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
 
 
+def test_litellm_client_chat_sends_several_labelled_images_in_order(monkeypatch):
+    seen = {}
+
+    def fake_completion(**kw):
+        seen.update(kw)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="hi", tool_calls=None))])
+
+    import litellm
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    client = LiteLLMClient("openai/test", api_base="http://x/v1", api_key="k")
+    client.chat([ChatMessage("user", content="[Attached image: shot 1; shot 2]")], TOOLS,
+                image_png=[("shot 1", b"PNG1"), ("shot 2", b"PNG2")])
+    parts = seen["messages"][-1]["content"]
+    assert [p["type"] for p in parts] == ["text", "text", "image_url", "text", "image_url"]
+    assert parts[1]["text"] == "Image 1: shot 1" and parts[3]["text"] == "Image 2: shot 2"
+    assert parts[2]["image_url"]["url"] != parts[4]["image_url"]["url"]
+
+
 def test_offline_chat_raises():
     with pytest.raises(RuntimeError, match="no LLM configured"):
         OfflineLLM().chat([ChatMessage("user", content="x")], TOOLS)

@@ -38,8 +38,16 @@ class ChatMessage:
     usage: dict | None = None  # on assistant messages from a real model: token counts
 
 
+# images for a chat turn: one PNG, or several (label, PNG) pairs shown in order, each with its label
+Images = bytes | list[tuple[str, bytes]] | None
+
+
+def _png_part(png: bytes) -> dict:
+    return {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64.b64encode(png).decode()}"}}
+
+
 class ToolLLM(Protocol):
-    def chat(self, messages: list[ChatMessage], tools: list[dict], image_png: bytes | None = None) -> ChatMessage: ...
+    def chat(self, messages: list[ChatMessage], tools: list[dict], image_png: Images = None) -> ChatMessage: ...
 
 
 def to_litellm(msg: ChatMessage) -> dict:
@@ -136,14 +144,18 @@ class LiteLLMClient:
         self._count(resp)
         return resp.choices[0].message.content or ""
 
-    def chat(self, messages: list[ChatMessage], tools: list[dict], image_png: bytes | None = None) -> ChatMessage:
+    def chat(self, messages: list[ChatMessage], tools: list[dict], image_png: Images = None) -> ChatMessage:
         import litellm
 
         payload = [to_litellm(m) for m in messages]
-        if image_png is not None and payload and payload[-1]["role"] == "user":
-            b64 = base64.b64encode(image_png).decode()
-            payload[-1]["content"] = [{"type": "text", "text": payload[-1]["content"] or ""},
-                                      {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}]
+        if image_png and payload and payload[-1]["role"] == "user":
+            parts: list[dict] = [{"type": "text", "text": payload[-1]["content"] or ""}]
+            if isinstance(image_png, bytes):
+                parts.append(_png_part(image_png))
+            else:
+                for n, (label, png) in enumerate(image_png, 1):
+                    parts += [{"type": "text", "text": f"Image {n}: {label}"}, _png_part(png)]
+            payload[-1]["content"] = parts
         resp = litellm.completion(model=self.model, api_base=self.api_base, api_key=self.api_key,
                                   temperature=self.temperature, num_retries=NUM_RETRIES, messages=payload,
                                   tools=tools or None)
@@ -158,7 +170,7 @@ class OfflineLLM:
     def complete(self, system: str, user: str, image_png: bytes | None = None) -> str:
         raise RuntimeError("no LLM configured (set LLM_API_KEY, or LLM_API_BASE for a local server)")
 
-    def chat(self, messages: list[ChatMessage], tools: list[dict], image_png: bytes | None = None) -> ChatMessage:
+    def chat(self, messages: list[ChatMessage], tools: list[dict], image_png: Images = None) -> ChatMessage:
         raise RuntimeError("no LLM configured (set LLM_API_KEY, or LLM_API_BASE for a local server)")
 
 
@@ -169,9 +181,9 @@ class ScriptedLLM:
     def __init__(self, script: list):
         self.script = list(script)
         self.calls: list[tuple[list[ChatMessage], list[dict]]] = []
-        self.images: list[bytes | None] = []
+        self.images: list[Images] = []
 
-    def chat(self, messages: list[ChatMessage], tools: list[dict], image_png: bytes | None = None) -> ChatMessage:
+    def chat(self, messages: list[ChatMessage], tools: list[dict], image_png: Images = None) -> ChatMessage:
         self.calls.append((list(messages), tools))
         self.images.append(image_png)
         if not self.script:
@@ -184,7 +196,7 @@ class FakeLLM:
     def __init__(self, responder: Callable[[str, str], str] | None = None):
         self.responder = responder
         self.calls: list[tuple[str, str]] = []
-        self.images: list[bytes | None] = []
+        self.images: list[Images] = []
 
     def complete(self, system: str, user: str, image_png: bytes | None = None) -> str:
         self.calls.append((system, user))
@@ -272,7 +284,7 @@ class TracingLLM:
         out = self.inner.complete(system, user, image_png)
         self._counted()
         self._write({"ts": time.time(), "ms": int((time.monotonic() - t0) * 1000), "kind": "complete",
-                     "system": system[:4000], "user": user[:4000], "image": image_png is not None,
+                     "system": system[:4000], "user": user[:4000], "image": bool(image_png),
                      "output": out[:4000]})
         return out
 
@@ -292,12 +304,12 @@ class TracingLLM:
     def chat(self):
         """Present only when the wrapped model can call tools (so `hasattr(llm, 'chat')` stays truthful)."""
         inner_chat = getattr(self.inner, "chat")        # AttributeError here makes hasattr(self, 'chat') False
-        def traced(messages: list[ChatMessage], tools: list[dict], image_png: bytes | None = None) -> ChatMessage:
+        def traced(messages: list[ChatMessage], tools: list[dict], image_png: Images = None) -> ChatMessage:
             t0 = time.monotonic()
             out = inner_chat(messages, tools, image_png)
             self._counted(out.usage)
             self._write({"ts": time.time(), "ms": int((time.monotonic() - t0) * 1000), "kind": "chat",
-                         "messages": [self._summary(m) for m in messages[-6:]], "image": image_png is not None,
+                         "messages": [self._summary(m) for m in messages[-6:]], "image": bool(image_png),
                          "output": self._summary(out), "usage": out.usage})
             return out
         return traced

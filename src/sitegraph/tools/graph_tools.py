@@ -1,7 +1,8 @@
 """Read-only tools over the site graph: find screens, plan routes, describe, recommend."""
 from __future__ import annotations
 
-from ..graph.queries import best_routes, entry_state, explain, find_targets, next_actions, recommendations
+from ..graph.queries import (best_routes, entry_state, explain, find_targets, next_actions, recommendations,
+                             shared_type_summary)
 from ..policy import ExplorationPolicy
 from .core import ToolContext, ToolSpec, Toolbox
 
@@ -23,9 +24,8 @@ def find_screens(ctx: ToolContext, args: dict):
         if t.item:
             # one state stands for every entry of a list and carries the name of whichever entry was seen last
             hit["item"] = t.item
-            hit["description"] = (f"Shared page type reached by choosing '{t.item}' from a list (its stored name "
-                                  f"'{t.text}' belongs to another entry of the same type). To open it: run_goal with "
-                                  f"goal '{args['query']}' and item '{t.item}'.")
+            hit["description"] = (shared_type_summary(t.text, t.item) +
+                                  f" To open it: run_goal with goal '{args['query']}' and item '{t.item}'.")
         out.append(hit)
     return out
 
