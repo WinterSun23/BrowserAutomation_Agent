@@ -112,3 +112,22 @@ def test_input_vars_lists_route_variables(store, gkey):
                                 (b)-[:ACTION {gid:'x2', value_var:'category', requires_inputs:['q']}]->(c),
                                 (a)-[:ACTION {gid:'x3'}]->(c)""")
     assert input_vars(store, gkey) == ["category", "q"]
+
+
+def _plan_of(steps, text):
+    return Planner(FakeLLM(lambda s, u: json.dumps({"steps": steps})), max_steps=6).plan(text)
+
+
+def test_an_explore_step_the_request_never_asked_for_is_dropped():
+    # a small model labels a plain question "explore": exploring is expensive, so it needs the user's word for it
+    plan = _plan_of([{"kind": "explore", "goal": "cheapest book"}], "so what is the cheapest book?")
+    assert [s.kind for s in plan.steps] == ["ask"]                       # the keyword fallback for a question
+    plan = _plan_of([{"kind": "explore", "goal": "site"}, {"kind": "ask", "goal": "cheapest book"}],
+                    "what is the cheapest book?")
+    assert [s.kind for s in plan.steps] == ["ask"]
+
+
+def test_repeated_explore_steps_become_one():
+    plan = _plan_of([{"kind": "explore", "goal": "site"}, {"kind": "explore", "goal": "philosophy"},
+                     {"kind": "ask", "goal": "cheapest"}], "explore the site and find the cheapest philosophy book")
+    assert [s.kind for s in plan.steps] == ["explore", "ask"]

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Callable
 
 from ..graph.queries import find_targets
@@ -36,6 +37,16 @@ How to work:
   saved. Never store secrets or personal data.
 - Keep going until the request is done, then answer briefly: what you did and what the user should know.
 """
+
+
+_WANTS_ANSWER = re.compile(
+    r"\?\s*$|\b(what|which|who|how (much|many|long)|where|when|why|find|cheapest|lowest|highest|best|compare|list|"
+    r"tell me|show me|price|cost|rating|count)\b", re.I)
+
+
+def wants_answer(text: str) -> bool:
+    """The request asks for information, not only for an action (so a finished action is not the whole job)."""
+    return bool(_WANTS_ANSWER.search(text or ""))
 
 
 class ExecutionAgent:
@@ -124,14 +135,19 @@ class ExecutionAgent:
         if self.orchestrator is not None:
             rr = self.orchestrator.handle(text, self.site)
             self.last_result = rr
-            if rr.status == "done":
+            if rr.status == "done" and rr.answer is None and wants_answer(text):
+                # the plan did what it could but never produced an answer: the model finishes the request
+                note = ("The saved map was used first and these steps are done: " + self._summary(rr) +
+                        " The user also wants an answer, so finish the request: use explore_toward, then find_screens "
+                        "/ run_goal, or observe, click and read_text by hand, and answer from what you read.")
+            elif rr.status == "done":
                 answer = self._summary(rr)
                 self.history += [ChatMessage("user", content=text), ChatMessage("assistant", content=answer)]
                 (on_event or (lambda e: None))({"type": "assistant", "content": answer})
                 if self.profile and self.session_id:
                     self.profile.log_request(self.session_id, text, "done", self.site.key, kind="chat")
                 return AgentRun("done", answer=answer, messages=self.history)
-            if rr.status != "chat":
+            if rr.status not in ("chat", "done"):
                 note = self._failure_note(rr, self.orchestrator.last_page)
         hint = note or self.map_hint(text)
         label = "Automatic plan run" if note else "Automatic map lookup"
