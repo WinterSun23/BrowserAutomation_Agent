@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import os
 import time
 from importlib.resources import files
@@ -26,6 +27,24 @@ _SCROLL_JS = """async () => {
 }"""
 _DEVICES = {"phone": "iPhone 13", "tablet": "iPad Pro 11"}
 
+# Playwright's sync API can be started only once per thread (a second start sees the first one's event loop and
+# refuses), so sessions on the same thread share one instance; the last session to close stops it.
+_local = threading.local()
+
+
+def _acquire_playwright():
+    if getattr(_local, "users", 0) == 0:
+        _local.pw = sync_playwright().start()
+    _local.users = getattr(_local, "users", 0) + 1
+    return _local.pw
+
+
+def _release_playwright() -> None:
+    _local.users -= 1
+    if _local.users == 0:
+        pw, _local.pw = _local.pw, None
+        pw.stop()
+
 
 class BrowserSession:
     def __init__(self, device: str = "desktop", headless: bool = True,
@@ -35,7 +54,7 @@ class BrowserSession:
         self.video_path: Path | None = None
 
     def __enter__(self) -> "BrowserSession":
-        self._pw = sync_playwright().start()
+        self._pw = _acquire_playwright()
         # an installed browser ("chrome", "msedge") instead of Playwright's own Chromium, when set
         channel = os.environ.get("SITEGRAPH_BROWSER_CHANNEL") or None
         self.browser = self._pw.chromium.launch(headless=self.headless, channel=channel)
@@ -56,7 +75,7 @@ class BrowserSession:
         if video:
             self.video_path = Path(video.path())
         self.browser.close()
-        self._pw.stop()
+        _release_playwright()
 
     def goto(self, url: str) -> None:
         self.page.goto(url, wait_until="domcontentloaded")

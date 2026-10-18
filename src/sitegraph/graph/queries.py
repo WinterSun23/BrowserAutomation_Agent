@@ -47,6 +47,23 @@ class Route:
 ITEM_TARGET_SCORE = 0.9
 
 
+def shared_type_summary(stored: str, item: str | None = None) -> str:
+    """How to name a shared page type (one state for every entry of a list, which carries the name of whichever
+    entry was seen last): by the chosen `item` when there is one, never by the stored name alone."""
+    if item:
+        return (f"Shared page type reached by choosing '{item}' from a list (its stored name '{stored}' belongs to "
+                f"another entry of the same type).")
+    return (f"Shared page type: one screen for every entry of a list (its stored name '{stored}' is just the entry "
+            f"seen last).")
+
+
+def shared_states(store: GraphStore, key: str) -> set[str]:
+    """States reached by clicking an entry of a repeated list: shared page types."""
+    return {r[0] for r in store.ro_query(key, """
+        MATCH (e:Element {is_template:true}) WITH collect(e.gid) AS tpl
+        MATCH (:State)-[a:ACTION]->(t:State) WHERE a.el_gid IN tpl RETURN DISTINCT t.gid""")}
+
+
 def _targets_from_list_items(store: GraphStore, key: str, text: str) -> list[Target]:
     """Screens reached by clicking a list item the request names (e.g. 'Mystery' in 'take me to the mystery
     category' -> the shared category screen), even if that exact instance was never visited."""
@@ -138,8 +155,10 @@ def next_actions(store: GraphStore, key: str, state: str, max_risk_cost: int, k:
         RETURN a.gid, a.label, t.gid, coalesce(t.summary, ''), a.seen_count, a.reliability,
                a.seen_count * a.reliability AS score
         ORDER BY score DESC LIMIT $k""", {"g": state, "mrc": max_risk_cost, "k": k})
-    return [dict(action_gid=r[0], label=r[1], target=r[2], target_summary=r[3], seen=r[4], reliability=r[5],
-                 score=r[6]) for r in rows]
+    shared = shared_states(store, key) if rows else set()
+    return [dict(action_gid=r[0], label=r[1], target=r[2],
+                 target_summary=shared_type_summary(r[3]) if r[2] in shared else r[3], seen=r[4],
+                 reliability=r[5], score=r[6]) for r in rows]
 
 
 def frontier_states(store: GraphStore, key: str, depth: int = 8, limit: int = 10) -> list[dict]:
@@ -150,7 +169,9 @@ def frontier_states(store: GraphStore, key: str, depth: int = 8, limit: int = 10
         WITH DISTINCT n WHERE n:Frontier
         RETURN n.gid, coalesce(n.summary, ''), n.untried_count, coalesce(n.harmonic, 0.0)
         ORDER BY n.untried_count DESC, coalesce(n.harmonic, 0.0) DESC LIMIT $limit""", {"depth": depth, "limit": limit})
-    return [dict(gid=r[0], summary=r[1], untried=r[2], harmonic=r[3]) for r in rows]
+    shared = shared_states(store, key) if rows else set()
+    return [dict(gid=r[0], summary=shared_type_summary(r[1]) if r[0] in shared else r[1], untried=r[2],
+                 harmonic=r[3]) for r in rows]
 
 
 def mine_sequences(store: GraphStore, key: str, min_freq: int = 2, limit: int = 10) -> list[dict]:

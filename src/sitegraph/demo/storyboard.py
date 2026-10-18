@@ -80,11 +80,13 @@ class StoryboardBuilder:
                     shots.append(ShotPlan(0, "micro", st["label"], False,
                                           transition={"gid": st["action_gid"], "el_gid": st["el_gid"]}))
         elif spec.scope_kind in ("goal", "state"):
-            targets = [t for t in find_targets(self.store, self.key, vec) if t.kind == "State"]
+            targets = [t for t in find_targets(self.store, self.key, vec, text=spec.target) if t.kind == "State"]
             if not targets:
                 raise DemoError("no screen matches the request")
-            shots += self._route(entry, targets[0].gid, hidden=spec.scope_kind == "state")
-            shots.append(ShotPlan(0, "still", targets[0].text, False, state_gid=targets[0].gid))
+            top = targets[0]
+            shots += self._route(entry, top.gid, hidden=spec.scope_kind == "state")
+            # a shared page type's stored name belongs to whichever entry was seen last: caption the chosen item
+            shots.append(ShotPlan(0, "still", top.item or top.text, False, state_gid=top.gid))
         elif spec.scope_kind == "transition":
             tr = self._find_transition(vec)
             shots += self._route(entry, tr["state_gid"], hidden=True)

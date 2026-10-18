@@ -79,9 +79,9 @@ class AgentLoop:
                 emit({"type": "assistant", "content": question})
                 return run
             if previews:                          # show the model the images its tools produced, on its next turn
-                history.append(ChatMessage("user", content="[Attached image: " + "; ".join(
-                    p.image_label or "preview" for p in previews) + "]"))
-                next_image = previews[-1].image_png
+                labels = [p.image_label or "preview" for p in previews]
+                history.append(ChatMessage("user", content="[Attached image: " + "; ".join(labels) + "]"))
+                next_image = [(label, p.image_png) for label, p in zip(labels, previews)]
             if run.tokens >= self.max_tokens:
                 run.status = "max_tokens"
                 run.answer = "Stopped: the token budget for this request was used up."
