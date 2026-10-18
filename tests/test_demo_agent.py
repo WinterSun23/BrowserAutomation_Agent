@@ -73,7 +73,8 @@ def test_agent_builds_a_gif_and_a_screenshot_through_tools(shop):
     assert "gif" in res.answer
     for _, ref in res.renders:
         assert blobs.path(ref).stat().st_size > 0
-    assert llm.images[4] and llm.images[4][:4] == b"\x89PNG"                      # the preview reached the model
+    [(label, png)] = llm.images[4]                                                # the preview reached the model
+    assert label.startswith("shot 0") and png[:4] == b"\x89PNG"
     assert store.ro_query(key, "MATCH (:Storyboard {gid:$g})-[:RENDERED_AS]->(r:Render) RETURN r.status ORDER BY r.format",
                           {"g": res.storyboard_gid}) == [["ok"], ["ok"]]
     assert store.ro_query(key, "MATCH (:Storyboard {gid:$g})<-[:IN_STORYBOARD]-(:Shot)-[:FROM_STEP]->(:Step) "

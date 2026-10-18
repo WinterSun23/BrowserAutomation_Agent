@@ -112,9 +112,23 @@ def test_a_tool_can_show_the_model_an_image_on_its_next_turn():
     llm = ScriptedLLM([call("preview"), say("looks fine")])
     run = AgentLoop(llm, box, "sys").run("check it", image_png=b"\x89PNGfirst")
     assert run.status == "done"
-    assert llm.images == [b"\x89PNGfirst", b"\x89PNGdata"]                      # caller's image first, then the preview
+    assert llm.images == [b"\x89PNGfirst", [("shot 1", b"\x89PNGdata")]]       # caller's image first, then the preview
     assert any(m.role == "user" and "shot 1" in (m.content or "") for m in llm.calls[1][0])
     assert '"shot": 1' in llm.calls[1][0][-2].content                          # the tool message itself stays text
+
+
+def test_every_preview_of_a_turn_reaches_the_model_with_its_label():
+    """Two previews in one turn used to send only the last image while telling the model it got both."""
+    from sitegraph.llm import ToolCall
+    from sitegraph.tools.core import ToolResult
+    box = _box()
+    box.register(ToolSpec("preview", "Preview", {"type": "object", "properties": {"shot": {"type": "integer"}}},
+                          lambda c, a: ToolResult(True, data={"shot": a["shot"]}, image_png=f"PNG{a['shot']}".encode(),
+                                                  image_label=f"shot {a['shot']}"), "read"))
+    both = ChatMessage("assistant", tool_calls=[ToolCall("1", "preview", {"shot": 1}), ToolCall("2", "preview", {"shot": 2})])
+    llm = ScriptedLLM([both, say("both fine")])
+    assert AgentLoop(llm, box, "sys").run("check them").status == "done"
+    assert llm.images[1] == [("shot 1", b"PNG1"), ("shot 2", b"PNG2")]
 
 
 def test_a_tool_can_ask_the_user_a_question_and_end_the_turn():
