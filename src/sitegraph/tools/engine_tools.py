@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import re
 
-from ..agents.curator import Curator
-from ..agents.escalation import make_curator_escalation
 from ..agents.orchestrator import MAX_NAVIGATORS, Orchestrator, SiteInfo
 from ..agents.workflows import save_workflow_from_run
 from ..db import ops_key
@@ -90,18 +88,14 @@ def _explore(ctx: ToolContext, args: dict):
     n = max(1, min(int(args.get("navigators") or cap), cap))
     orch = Orchestrator(ctx.settings, ctx.store, ctx.embedder, ctx.llm, ctx.blobs, NullEvents())
     site = SiteInfo(ctx.domain, ctx.device, ctx.key, ops_key(ctx.settings.uid, ctx.domain), entry)
-    policy = policy_of(ctx)
+    # exploration mode from config (auto / brute / guided); with git one branch per browser, merged by the Curator
+    res = orch.explore(site, policy_of(ctx), "chat-explore", n)
+    out = {"states": res["states"], "actions": res["actions"], "transitions": res["transitions"],
+           "blocked_as_risky": res["blocked"], "navigators": n, "agents": res["agents"], "mode": res["mode"],
+           "mode_reason": res["mode_reason"]}
     if ctx.settings.use_git:
-        # one branch per browser, merged by the Curator (which also recomputes the algorithms)
-        res = orch._explore_git(site, policy, "chat-explore", n)
-        return {"states": res["states"], "actions": res["actions"], "transitions": res["transitions"],
-                "blocked_as_risky": res["blocked"], "navigators": n, "agents": res["agents"],
-                "merge_commit": res["merge_commit"]}
-    rep, agents = orch._explore(site, policy, "chat-explore", n)
-    stats = Curator(ctx.store, ctx.key, ctx.settings, ctx.embedder, ctx.llm).run_all(
-        policy.max_risk_cost, escalate=make_curator_escalation(ctx.settings, ctx.store, ctx.key, ctx.embedder, ctx.llm))
-    return {"states": len(rep.states), "actions": rep.actions, "transitions": rep.transitions,
-            "blocked_as_risky": rep.blocked, "navigators": n, "agents": agents, **stats}
+        return {**out, "merge_commit": res.get("merge_commit")}
+    return {**out, **{k: v for k, v in res.items() if k not in out and k not in ("kind", "blocked", "spawned")}}
 
 
 def _explore_toward(ctx: ToolContext, args: dict):

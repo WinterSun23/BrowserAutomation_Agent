@@ -1,0 +1,27 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Book finder</title><script src="shop.js"></script></head>
+<body><main>
+<h1>Find a book</h1>
+<form action="results.html" method="get" aria-label="Book finder">
+  <label for="q">Search books</label><input id="q" name="q" type="search">
+  <label for="category">Category</label>
+  <select id="category" name="category">
+    <option>Any</option><option>Mystery</option><option>Travel</option><option>Poetry</option>
+  </select>
+  <label><input type="checkbox" name="in_stock" value="1"> In stock</label>
+  <fieldset><legend>Format</legend>
+    <label><input type="radio" name="format" value="paperback"> Paperback</label>
+    <label><input type="radio" name="format" value="hardcover"> Hardcover</label>
+    <label><input type="radio" name="format" value="ebook"> Ebook</label>
+  </fieldset>
+  <label for="max_price">Max price</label><input id="max_price" name="max_price" type="number" min="0" max="100">
+  <label for="price">Price up to</label><input id="price" name="price" type="range" min="0" max="100" step="5">
+  <label for="after">Published after</label><input id="after" name="after" type="date">
+  <label for="email">Email me results</label><input id="email" name="email" type="email">
+  <label for="pw">Password</label><input id="pw" name="pw" type="password">
+  <button type="submit">Search</button>
+</form>
+<form action="checkout.html" method="get" aria-label="Quick order">
+  <label for="gift">Gift message</label><input id="gift" name="gift" type="text">
+  <button type="submit">Place order</button>
+</form>
+</main></body></html>

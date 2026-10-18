@@ -35,3 +35,31 @@ def classify_risk(role: str, name_norm: str, href: str | None = None, page_domai
     if role in _NAV_ROLES:
         return "navigate"
     return "submit_safe"
+
+
+def press_risk(el_in_form_submit_risk: str | None) -> str:
+    """Risk of pressing a key: Enter inside a form does what the form's submit button does; any other press (Enter
+    in a lone search box, Escape, arrows) at most navigates."""
+    return el_in_form_submit_risk or "navigate"
+
+
+_SENSITIVE_TYPES = {"password", "email", "tel"}
+_SENSITIVE_AUTOCOMPLETE = re.compile(r"^(cc-.*|email|tel(-.*)?|street-address|postal-code|name|given-name|"
+                                     r"family-name|username|current-password|new-password)$")
+_SENSITIVE_NAME = re.compile(r"(?i)password|e-?mail|phone|card|cvv|iban|address|first.?name|last.?name|ssn")
+
+
+def is_sensitive_field(el) -> bool:
+    """A field that is never typed into or set from a goal or a model: passwords, e-mail, phone, payment, address
+    and personal names (by input type, autocomplete hint or name). `el` is an ElementObs or an element dict."""
+    get = el.get if isinstance(el, dict) else (lambda k, d=None: getattr(el, k, d))
+    if (get("input_kind") or "").lower() in _SENSITIVE_TYPES:
+        return True
+    fp = get("fingerprint") or {}
+    attrs = (fp.get("attrs") if isinstance(fp, dict) else None) or {}
+    auto = str((get("limits") or {}).get("autocomplete") or "").lower().split()
+    if any(_SENSITIVE_AUTOCOMPLETE.match(a) for a in auto):
+        return True
+    text = " ".join(str(x) for x in (get("name_norm"), get("name_sample"), attrs.get("name"), attrs.get("id"),
+                                     attrs.get("placeholder")) if x)
+    return bool(_SENSITIVE_NAME.search(text))

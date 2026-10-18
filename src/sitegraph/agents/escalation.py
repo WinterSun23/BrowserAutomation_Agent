@@ -13,7 +13,8 @@ from .loop import AgentLoop, AgentRun
 
 # No exploring, no demos, no memory and no run_goal here: the recovery agent works on the open page only.
 RECOVERY_TOOLS = {"observe", "list_items", "click", "hover", "scroll", "read_text", "open_url",
-                  "find_screens", "plan_route", "describe_state"}
+                  "find_screens", "plan_route", "describe_state", "select_option", "set_checked", "press",
+                  "fill_inputs"}
 
 RECOVERY_SYSTEM = """You are the recovery agent of a website automation system. A saved, previously working step
 failed on the live page. Your job: find out what is in the way and clear it, so the step can go ahead.

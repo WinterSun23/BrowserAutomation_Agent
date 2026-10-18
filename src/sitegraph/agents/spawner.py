@@ -7,14 +7,23 @@ from typing import Callable
 
 
 def run_scaled(agents: list[str], run_one: Callable[[str], object], backlog: Callable[[], int], *,
-               min_backlog: int, after_s: float, poll_s: float = 0.5):
+               min_backlog: int, after_s: float, poll_s: float = 0.5, on_start: Callable[[str], None] | None = None):
     """Run `run_one(agent)` for `agents[0]` now, and for each next agent only when `backlog()` has stayed at or above
     `min_backlog` for `after_s` seconds (the timer restarts after every spawn, so the next one waits for more work).
     Nothing more is started once every running agent has finished. Returns (results, errors, started) where results
     is [(agent, result)] in start order; one failing agent never loses the others' results."""
     futures: list[tuple[str, object]] = []
+
+    def start(agent: str) -> None:
+        if on_start:
+            try:
+                on_start(agent)
+            except Exception:
+                pass
+        futures.append((agent, ex.submit(run_one, agent)))
+
     with ThreadPoolExecutor(max_workers=max(1, len(agents))) as ex:
-        futures.append((agents[0], ex.submit(run_one, agents[0])))
+        start(agents[0])
         since: float | None = None
         while any(not f.done() for _, f in futures):
             if len(futures) < len(agents):
@@ -26,8 +35,7 @@ def run_scaled(agents: list[str], run_one: Callable[[str], object], backlog: Cal
                 if pending >= min_backlog:
                     since = now if since is None else since
                     if now - since >= after_s:
-                        agent = agents[len(futures)]
-                        futures.append((agent, ex.submit(run_one, agent)))
+                        start(agents[len(futures)])
                         since = None
                 else:
                     since = None

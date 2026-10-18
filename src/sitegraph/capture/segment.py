@@ -12,10 +12,13 @@ from .model import ComponentObs, ElementObs, RawNode, RawSnapshot, StateObs
 COMPONENT_KINDS = {"navigation", "banner", "contentinfo", "main", "form", "search", "complementary", "dialog",
                    "alertdialog", "menu", "menubar", "listbox", "tablist", "tabpanel", "toolbar", "tooltip",
                    "status", "alert", "region", "list", "table", "grid", "feed", "group"}
+# content regions: under coarse identity they count roles, not element names (their entries change all the time)
+CONTENT_KINDS = {"main", "list", "feed", "grid", "table", "article", "region"}
 EPHEMERAL_KINDS = {"menu", "listbox", "tooltip", "tabpanel", "tablist", "status", "alert", "group"}
 ITEM_ROLES = {"listitem", "row", "article"}
 CLICKABLE_ROLES = {"link", "button", "menuitem", "menuitemcheckbox", "menuitemradio", "tab", "switch"}
 _ROLE_LOCATABLE = CLICKABLE_ROLES | {"textbox", "searchbox", "combobox", "checkbox", "radio", "option"}
+_CHECKABLE = {"checkbox", "radio", "switch"}
 _INPUT_KIND = {"combobox": "select", "listbox": "select", "checkbox": "checkbox", "radio": "radio"}
 
 
@@ -89,6 +92,18 @@ def _hoverable(n: RawNode) -> bool:
     return s.get("haspopup") not in (None, "", "false") or s.get("popup") == "true"
 
 
+def _selected_option(n: RawNode) -> str | None:
+    i = n.selected_index
+    return n.options[i] if n.options and i is not None and 0 <= i < len(n.options) else None
+
+
+def _limits(n: RawNode) -> dict:
+    lim = dict(n.limits or {})
+    if (n.states or {}).get("disabled") == "true":
+        lim["disabled"] = True
+    return lim
+
+
 def _identity_key(n: RawNode) -> str:
     if n.role == "link" and n.href:
         return "href:" + url_template(n.href)
@@ -101,7 +116,32 @@ def _component_gid(kind: str, root: RawNode | None, tpl: str) -> str:
     return gid("cp", kind, normalize_text(root.name), root.gcss)
 
 
-def build_state(raw: RawSnapshot, domain: str, template_min: int = 4) -> StateObs:
+def count_bucket(n: int) -> str:
+    """Coarse identity counts content elements in buckets, so a list of 7 or of 9 results is the same screen."""
+    if n <= 1:
+        return "1"
+    if n <= 4:
+        return "2-4"
+    return "5-19" if n <= 19 else "20+"
+
+
+def _state_tokens(c: ComponentObs, coarse: bool) -> set[str]:
+    """Similarity tokens of a component (near-duplicate matching): coarse content regions count roles, not names."""
+    if not (coarse and c.kind in CONTENT_KINDS):
+        return {f"{c.kind}|{e.role}|{e.href_template or e.name_norm}" for e in c.elements}
+    counts: dict[str, int] = defaultdict(int)
+    named = set()
+    for e in c.elements:
+        if e.in_form or e.is_template:       # forms keep names; a repeated list is one token whatever its size
+            named.add(f"{c.kind}|{e.role}|{e.href_template or e.name_norm}")
+        else:
+            counts[e.role] += 1
+    return named | {f"{c.kind}|{role}|{count_bucket(n)}" for role, n in counts.items()}
+
+
+def build_state(raw: RawSnapshot, domain: str, template_min: int = 4, identity: str = "coarse") -> StateObs:
+    """`identity`: "coarse" (content regions of CONTENT_KINDS contribute role|count-bucket tokens, not element names,
+    so feeds and result lists whose entries change stay one State) or "fine" (every element name counts)."""
     nodes = raw.nodes
     tpl = url_template(raw.url)
     page_gid = gid("pg", domain, tpl)
@@ -158,7 +198,12 @@ def build_state(raw: RawSnapshot, domain: str, template_min: int = 4) -> StateOb
         seen: dict[tuple[str, str], int] = defaultdict(int)
         elements: list[ElementObs] = []
         aria_state: dict = {}
+        coarse = identity == "coarse" and kind in CONTENT_KINDS
+        role_counts: dict[str, int] = defaultdict(int)   # coarse content: how many elements of each role
         for n, key, _ in built:
+            if coarse and form_of(n) is None and n.idx not in tpl_rep:   # a repeated list's size never counts
+                role_counts[n.role] += 1
+                continue
             if n.idx in tpl_rep:
                 t, j = tpl_rep[n.idx]
                 pos = t.positions[j]
@@ -168,6 +213,7 @@ def build_state(raw: RawSnapshot, domain: str, template_min: int = 4) -> StateOb
                 tokens.append(f"{n.role}|{key}|T")
             else:
                 tokens.append(f"{n.role}|{key}")
+        tokens += [f"{role}|{count_bucket(c)}|C" for role, c in sorted(role_counts.items())]
         skeleton_hash = _sha16("\n".join(tokens))
         cs_gid = gid("cs", comp_gid, skeleton_hash)
         for n, key, _ in built:
@@ -182,7 +228,10 @@ def build_state(raw: RawSnapshot, domain: str, template_min: int = 4) -> StateOb
                           else _INPUT_KIND.get(n.role),
                           href_template=url_template(n.href) if n.href else None,
                           in_form=comp_gids.get(form_idx) if form_idx is not None else None,
-                          hoverable=_hoverable(n), inferred=n.inferred)
+                          hoverable=_hoverable(n), inferred=n.inferred, options=list(n.options or []),
+                          selected=_selected_option(n),
+                          checked=(n.states or {}).get("checked") == "true" if n.role in _CHECKABLE else None,
+                          limits=_limits(n))
             if n.idx in tpl_rep:
                 t, j = tpl_rep[n.idx]
                 pos = t.positions[j]
@@ -222,9 +271,9 @@ def build_state(raw: RawSnapshot, domain: str, template_min: int = 4) -> StateOb
                                        aria_state=aria_state, elements=elements,
                                        root_bbox=root.bbox if root else None))
 
-    identity = [c for c in components if not c.ephemeral]
-    state_gid = gid("st", page_gid, *sorted(c.cs_gid for c in identity))
-    tokens = sorted({tpl} | {f"{c.kind}|{e.role}|{e.href_template or e.name_norm}" for c in identity for e in c.elements})
+    kept = [c for c in components if not c.ephemeral]
+    state_gid = gid("st", page_gid, *sorted(c.cs_gid for c in kept))
+    tokens = sorted({tpl}.union(*(_state_tokens(c, identity == "coarse") for c in kept)))
     return StateObs(url=raw.url, url_template=tpl, title=raw.title, page_gid=page_gid, state_gid=state_gid,
                     skeleton_hash=_sha16("\n".join(tokens)), tokens=tokens,
                     blocking_sig=",".join(sorted(c.gid for c in components if c.blocking)),

@@ -1,0 +1,213 @@
+# Public sites built for scraping practice. Needs network; keep budgets small and respect robots.txt (see
+# eval/README.md). Every task runs in a fresh namespace, so tasks that need a map explore first (`setup`).
+# Tasks with `requires:` are skipped (outcome "skip") until that feature is listed in
+# sitegraph.eval.suite.SUPPORTED_FEATURES.
+name: public
+defaults:
+  navigators_per_site: 2
+  policy: {max_states: 40, budget_s: 180, max_depth: 3}
+tasks:
+  # ---------- books.toscrape.com ----------
+  - id: books-explore
+    site: https://books.toscrape.com/
+    request: explore the site
+    max_seconds: 420
+    checks:
+      - result: kind == explore
+      - result: states >= 10
+
+  - id: books-travel
+    site: https://books.toscrape.com/
+    setup: [explore the site]
+    request: take me to the Travel category
+    max_seconds: 600
+    checks:
+      - result: status == done
+      - url_matches: category/books/travel
+
+  - id: books-price
+    site: https://books.toscrape.com/
+    setup: [explore the site]
+    request: What is the price of A Light in the Attic?
+    max_seconds: 600
+    checks:
+      - answer_contains_any: ["51.77"]
+
+  # ---------- quotes.toscrape.com ----------
+  - id: quotes-explore
+    site: https://quotes.toscrape.com/
+    request: explore the site
+    max_seconds: 420
+    checks:
+      - result: states >= 5
+
+  - id: quotes-tag-love
+    site: https://quotes.toscrape.com/
+    setup: [explore the site]
+    request: show me the quotes tagged love
+    max_seconds: 600
+    checks:
+      - url_matches: /tag/love
+
+  - id: quotes-author
+    site: https://quotes.toscrape.com/
+    setup: [explore the site]
+    request: open the about page of Albert Einstein
+    max_seconds: 600
+    checks:
+      - url_matches: author/Albert-Einstein
+
+  - id: quotes-who-wrote
+    site: https://quotes.toscrape.com/
+    setup: [explore the site]
+    request: Who wrote the quote "The world as we have created it is a process of our thinking"?
+    max_seconds: 600
+    checks:
+      - answer_contains_any: ["Einstein"]
+
+  # ---------- webscraper.io test sites ----------
+  - id: webscraper-explore
+    site: https://webscraper.io/test-sites/e-commerce/allinone
+    request: explore the site
+    max_seconds: 420
+    checks:
+      - result: states >= 5
+
+  - id: webscraper-laptops
+    site: https://webscraper.io/test-sites/e-commerce/allinone
+    setup: [explore the site]
+    request: take me to the laptops
+    max_seconds: 600
+    checks:
+      - url_matches: computers/laptops
+
+  - id: webscraper-tablets
+    site: https://webscraper.io/test-sites/e-commerce/allinone
+    setup: [explore the site]
+    request: take me to the tablets
+    max_seconds: 600
+    checks:
+      - url_matches: computers/tablets
+
+  # ---------- the-internet.herokuapp.com ----------
+  - id: internet-explore
+    site: https://the-internet.herokuapp.com/
+    request: explore the site
+    max_seconds: 420
+    checks:
+      - result: states >= 10
+
+  - id: internet-checkboxes-page
+    site: https://the-internet.herokuapp.com/
+    setup: [explore the site]
+    request: open the Checkboxes example
+    max_seconds: 600
+    checks:
+      - url_matches: /checkboxes
+
+  - id: internet-dropdown
+    site: https://the-internet.herokuapp.com/dropdown
+    setup: [explore the site]
+    request: select Option 2 in the dropdown list
+    requires: [select]
+    max_seconds: 600
+    checks:
+      - result: status == done
+      - url_matches: /dropdown
+
+  - id: internet-tick-checkbox
+    site: https://the-internet.herokuapp.com/checkboxes
+    setup: [explore the site]
+    request: tick checkbox 1
+    requires: [check]
+    max_seconds: 600
+    checks:
+      - result: status == done
+
+  # ---------- scrapethissite.com ----------
+  - id: scrapethis-explore
+    site: https://www.scrapethissite.com/pages/
+    request: explore the site
+    max_seconds: 420
+    checks:
+      - result: states >= 5
+
+  - id: scrapethis-capital
+    site: https://www.scrapethissite.com/pages/simple/
+    setup: [explore the site]
+    request: What is the capital of Andorra?
+    max_seconds: 600
+    checks:
+      - answer_contains_any: ["Andorra la Vella"]
+
+  - id: scrapethis-oscars
+    site: https://www.scrapethissite.com/pages/
+    setup: [explore the site]
+    request: open the Oscar winning films page
+    max_seconds: 600
+    checks:
+      - url_matches: ajax-javascript
+
+  - id: scrapethis-hockey-search
+    site: https://www.scrapethissite.com/pages/forms/
+    setup: [explore the site]
+    request: search the hockey teams for Boston
+    requires: [inputs]
+    max_seconds: 600
+    checks:
+      - page_contains: Boston Bruins
+
+  # ---------- cold start: no setup, the map is empty, so goal search has to find the target ----------
+  # The ceilings make "found it, but crawled half the site" a failure. `states` is read from the run's own
+  # numbers (screens created by this request) because an automate / ask result has no `states` field.
+  - id: books-price-cold
+    site: https://books.toscrape.com/
+    request: What is the price of A Light in the Attic?
+    max_seconds: 600
+    max_tokens: 60000
+    checks:
+      - answer_contains_any: ["51.77"]
+      - result: goal_explore.found == true
+      - result: states <= 40
+
+  - id: books-mystery-cold
+    site: https://books.toscrape.com/
+    request: take me to the Mystery category
+    max_seconds: 600
+    max_tokens: 60000
+    checks:
+      - url_matches: category/books/mystery
+      - result: goal_explore.found == true
+      - result: states <= 40
+
+  - id: quotes-author-cold
+    site: https://quotes.toscrape.com/
+    request: open the about page of Albert Einstein
+    max_seconds: 600
+    max_tokens: 60000
+    checks:
+      - url_matches: author/Albert-Einstein
+      - result: goal_explore.found == true
+      - result: states <= 40
+
+  - id: webscraper-tablets-cold
+    site: https://webscraper.io/test-sites/e-commerce/allinone
+    request: take me to the tablets
+    max_seconds: 600
+    max_tokens: 60000
+    checks:
+      - url_matches: computers/tablets
+      - result: goal_explore.found == true
+      - result: states <= 40
+
+  - id: scrapethis-hockey-search-cold
+    site: https://www.scrapethissite.com/pages/forms/
+    request: search the hockey teams for Boston
+    requires: [inputs]
+    max_seconds: 600
+    max_tokens: 60000
+    checks:
+      - page_contains: Boston Bruins
+      - result: goal_explore.found == true
+      - result: goal_explore.how == inputs
+      - result: states <= 40

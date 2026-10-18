@@ -20,13 +20,20 @@ def _props(d: dict) -> dict:
     return {k: v for k, v in d.items() if k != "emb"}
 
 
+def _remap_token(token: str, el_map: dict[str, str]) -> str:
+    """'<kind>|<el_gid>' or '<kind>|<el_gid>|<value>' (select / check / press steps) with the element remapped."""
+    kind, _, rest = token.partition("|")
+    g, sep, value = rest.partition("|")
+    return f"{kind}|{el_map.get(g, g)}{sep}{value}"
+
+
 def _remap_action_lists(props: dict, el_map: dict[str, str]) -> dict:
     """Element gids also sit inside lists on an action: the inputs it needs and the steps learned from recoveries."""
     p = dict(props)
     if p.get("requires_inputs"):
         p["requires_inputs"] = [el_map.get(g, g) for g in p["requires_inputs"]]
     if p.get("pre_actions"):
-        p["pre_actions"] = [f"{k}|{el_map.get(g, g)}" for k, _, g in (t.partition("|") for t in p["pre_actions"])]
+        p["pre_actions"] = [_remap_token(t, el_map) for t in p["pre_actions"]]
     return p
 
 
@@ -43,7 +50,7 @@ def rehash(store, key: str, blobs, settings, domain: str) -> dict:
     el_map: dict[str, str] = {}
     def replay(snap: str, old_elements) -> str:
         raw = RawSnapshot.from_dict(json.loads(gzip.decompress(blobs.read(snap))))
-        obs = build_state(raw, domain, settings.template_min_items)
+        obs = build_state(raw, domain, settings.template_min_items, settings.state_identity)
         new_sg = w.write_state(obs, snapshot_ref=snap)
         by_css = {e.css: e.gid for e in obs.elements()}
         by_item = {e.item_locator: e.gid for e in obs.elements() if e.is_template}

@@ -1,0 +1,33 @@
+# The fixture shop (tests/fixtures/site) served locally, no network and no model needed. Used in CI and as the
+# baseline: python -m sitegraph eval eval/suites/offline.yaml --embedder hash
+name: offline
+serve: tests/fixtures/site          # served on a free local port when --site-url is not given
+defaults:
+  min_target_score: 0.3
+  navigators_per_site: 2
+tasks:
+  - id: explore
+    site: "{site}/index.html"
+    request: explore the site
+    max_seconds: 300
+    checks:
+      - result: kind == explore
+      - result: states >= 5
+
+  - id: cart
+    site: "{site}/index.html"
+    setup: [explore the site]
+    request: take me to the cart
+    max_seconds: 300
+    checks:
+      - result: status == done
+      - url_matches: cart
+
+  - id: cart-cold                 # no setup: the map is empty, so goal search has to find the cart
+    site: "{site}/index.html"
+    request: take me to the cart
+    max_seconds: 300
+    checks:
+      - result: goal_explore.found == true
+      - url_matches: cart
+      - result: states <= 40

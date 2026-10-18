@@ -8,6 +8,7 @@ from sitegraph.blobs import BlobStore
 from sitegraph.browser.session import BrowserSession
 from sitegraph.catalog import REL_CATALOG
 from sitegraph.config import Settings
+from sitegraph.versions import ALGO_VERSION
 from sitegraph.db import device_key
 from sitegraph.embed import HashEmbedder
 from sitegraph.graph.map_writer import MapWriter
@@ -55,7 +56,7 @@ def test_graph_uses_only_catalogued_types(store, built):
 
 def test_site_node_versions(store, built):
     key = built[0]
-    assert store.ro_query(key, "MATCH (s:Site) RETURN s.schema_version, s.algo_version, s.embed_dim") == [[2, 1, 384]]
+    assert store.ro_query(key, "MATCH (s:Site) RETURN s.schema_version, s.algo_version, s.embed_dim") == [[2, ALGO_VERSION, 384]]
 
 
 def test_a_different_embedding_model_is_refused(store, built):

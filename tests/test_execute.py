@@ -87,3 +87,36 @@ def test_save_and_replay_workflow(world):
         res2 = _nav(world, s).execute_workflow(wf)
         assert res2.status == "done" and s.url.endswith("/cart.html")
     assert store.ro_query(key, "MATCH (w:Workflow {gid:$w}) RETURN w.run_count", {"w": wf}) == [[1]]
+
+
+def test_close_targets_go_to_the_planners_choice(world, monkeypatch):
+    """Two targets within choose_margin: planner.choose_target (monkeypatched here) picks the one to drive to."""
+    import sys
+    import types
+
+    import sitegraph.agents.navigator as navmod
+    from sitegraph.graph.queries import Target
+
+    store, settings, key, _ = world
+    cart = store.ro_query(key, "MATCH (:Page {url_template:'/cart.html'})-[:HAS_STATE]->(s:State) RETURN s.gid LIMIT 1")[0][0]
+    about = store.ro_query(key, "MATCH (:Page {url_template:'/about.html'})-[:HAS_STATE]->(s:State) RETURN s.gid LIMIT 1")[0][0]
+    close = [Target("State", about, "about", 0.81), Target("State", cart, "cart", 0.80)]
+    monkeypatch.setattr(navmod, "find_targets", lambda *a, **k: list(close))
+    seen = {}
+
+    def choose_target(llm, request, candidates, store=None, key=None):
+        seen.update(request=request, n=len(candidates))
+        return candidates[1]
+
+    monkeypatch.setitem(sys.modules, "sitegraph.agents.planner", types.SimpleNamespace(choose_target=choose_target))
+    with BrowserSession() as s:
+        nav = Navigator(store, key, world[3], s, settings, HashEmbedder(), llm=FakeLLM())
+        res = nav.execute_goal("open the cart please")
+        assert res.status == "done" and s.url.endswith("/cart.html")
+    assert seen == {"request": "open the cart please", "n": 2}
+    # a clear winner (gap above the margin) needs no model
+    close[1] = Target("State", cart, "cart", 0.5)
+    seen.clear()
+    with BrowserSession() as s:
+        Navigator(store, key, world[3], s, settings, HashEmbedder(), llm=FakeLLM()).execute_goal("about")
+    assert seen == {}

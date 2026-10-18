@@ -1,0 +1,34 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Filter items</title><script src="shop.js"></script>
+<script>
+function applyFacets() {
+  const on = [...document.querySelectorAll('input.facet:checked')].map(c => c.name);
+  document.querySelectorAll('#items li').forEach(li => {
+    li.hidden = !on.every(f => li.dataset[f] === '1');
+  });
+  history.replaceState(null, '', on.length ? '?f=' + on.join(',') : location.pathname);
+}
+function openHelp() { document.getElementById('help').hidden = false; }
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') document.getElementById('help').hidden = true;
+});
+</script></head>
+<body><main>
+<h1>Filter items</h1>
+<label><input type="checkbox" class="facet" name="stock" onchange="applyFacets()"> In stock</label>
+<label><input type="checkbox" class="facet" name="sale" onchange="applyFacets()"> On sale</label>
+<ul id="items" aria-label="Items">
+  <li data-stock="1" data-sale="0">Red lamp</li>
+  <li data-stock="0" data-sale="1">Blue chair</li>
+  <li data-stock="1" data-sale="1">Green desk</li>
+</ul>
+<input type="search" id="find" aria-label="Find items"
+       onkeydown="if (event.key === 'Enter') location = 'results.html?q=' + encodeURIComponent(this.value)">
+<button onclick="openHelp()">Show help</button>
+<div id="help" role="dialog" aria-modal="true" aria-label="Help" hidden>
+  <p>Press Escape to close.</p><a href="about.html">Read the guide</a>
+</div>
+<form action="checkout.html" method="get" aria-label="Order">
+  <label for="coupon">Coupon code</label><input id="coupon" name="coupon">
+  <button type="submit">Place order</button>
+</form>
+</main></body></html>

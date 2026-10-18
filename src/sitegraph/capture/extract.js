@@ -156,6 +156,19 @@
       attrs: { id: el.id || null, class: typeof el.className === 'string' && el.className ? el.className : null,
                name: el.getAttribute('name'), placeholder: el.getAttribute('placeholder') },
     };
+    if (node.tag === 'input' || node.tag === 'textarea') {
+      // limits of number / range / date inputs, the autocomplete hint (sensitive fields) and the radio group
+      const lim = {};
+      for (const a of ['min', 'max', 'step', 'autocomplete']) { const v = el.getAttribute(a); if (v !== null) lim[a] = v; }
+      if ((node.input_type || '').toLowerCase() === 'radio' && el.name) lim.group = el.name;
+      if (el.disabled) lim.disabled = true;
+      node.limits = lim;
+    }
+    if (node.tag === 'select') {
+      // the first 30 option labels and which one is selected now (sort / filter dropdowns)
+      node.options = [...el.options].slice(0, 30).map(o => (o.label || o.text || '').replace(/\s+/g, ' ').trim());
+      node.selected_index = el.selectedIndex;
+    }
     index.set(el, node.idx); nodes.push(node);
   }
   return { url: location.href, title: document.title, nodes };

@@ -1,0 +1,15 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Sorted list</title><script src="shop.js"></script></head>
+<body><main>
+<h1>All items</h1>
+<label for="sort">Sort by</label>
+<select id="sort" name="sort" onchange="location = 'results.html?sort=' + encodeURIComponent(this.value)">
+  <option value="relevance" selected>Relevance</option>
+  <option value="price">Price</option>
+  <option value="rating">Rating</option>
+</select>
+<form action="results.html" method="get">
+  <label for="cat">Category</label>
+  <select id="cat" name="cat"><option>Any</option><option>Books</option><option>Music</option></select>
+
+</form>
+</main></body></html>

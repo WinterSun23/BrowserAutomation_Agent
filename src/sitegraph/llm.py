@@ -219,6 +219,33 @@ class TracingLLM:
         self.dir.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         self.calls = 0
+        self._lock = threading.Lock()
+        self._since_reset = 0              # calls since reset_counters (eval runs read these per task)
+        self._chat_tokens = 0              # tokens reported on chat replies (used when the inner model keeps no usage)
+        self._base_tokens = self._inner_tokens()
+
+    def _inner_tokens(self) -> int | None:
+        u = getattr(self.inner, "usage", None)
+        if not isinstance(u, dict) or "prompt_tokens" not in u:
+            return None
+        return int(u.get("prompt_tokens", 0) or 0) + int(u.get("completion_tokens", 0) or 0)
+
+    def counters(self) -> dict:
+        """Model calls and tokens since the last `reset_counters` (all threads of this wrapper together)."""
+        now = self._inner_tokens()
+        tokens = now - (self._base_tokens or 0) if now is not None else self._chat_tokens
+        return {"calls": self._since_reset, "tokens": int(tokens)}
+
+    def reset_counters(self) -> None:
+        with self._lock:
+            self._since_reset, self._chat_tokens, self._base_tokens = 0, 0, self._inner_tokens()
+
+    def _counted(self, usage: dict | None = None) -> None:
+        with self._lock:
+            self.calls += 1
+            self._since_reset += 1
+            if usage and isinstance(usage.get("total_tokens"), int):
+                self._chat_tokens += usage["total_tokens"]
 
     @property
     def usage(self) -> dict:
@@ -243,7 +270,7 @@ class TracingLLM:
     def complete(self, system: str, user: str, image_png: bytes | None = None) -> str:
         t0 = time.monotonic()
         out = self.inner.complete(system, user, image_png)
-        self.calls += 1
+        self._counted()
         self._write({"ts": time.time(), "ms": int((time.monotonic() - t0) * 1000), "kind": "complete",
                      "system": system[:4000], "user": user[:4000], "image": image_png is not None,
                      "output": out[:4000]})
@@ -268,7 +295,7 @@ class TracingLLM:
         def traced(messages: list[ChatMessage], tools: list[dict], image_png: bytes | None = None) -> ChatMessage:
             t0 = time.monotonic()
             out = inner_chat(messages, tools, image_png)
-            self.calls += 1
+            self._counted(out.usage)
             self._write({"ts": time.time(), "ms": int((time.monotonic() - t0) * 1000), "kind": "chat",
                          "messages": [self._summary(m) for m in messages[-6:]], "image": image_png is not None,
                          "output": self._summary(out), "usage": out.usage})

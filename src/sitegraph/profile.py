@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import replace
 
 from .db import GraphStore, profile_key
 from .embed import cosine
@@ -63,6 +64,26 @@ class Profile:
                       g=gid("site", domain, device))
         stored = ExplorationPolicy.from_dict(json.loads(rows[0][0])) if rows else self._stored_default_policy()
         return stored.with_overrides(self.policy_overrides)
+
+    def add_deny_patterns(self, domain: str, device: str, patterns: list[str]) -> list[str]:
+        """Merge skip rules (bootstrap, guided exploration) into this site's own policy, creating it from the default
+        on first use. Patterns that do not compile and ones already there are left out; returns the ones added."""
+        rows = self.q("MATCH (p:ExplorationPolicy)-[:APPLIES_TO]->(:SiteEntry {gid:$g}) RETURN p.data LIMIT 1",
+                      g=gid("site", domain, device))
+        stored = ExplorationPolicy.from_dict(json.loads(rows[0][0])) if rows else self._stored_default_policy()
+        added = []
+        for p in patterns:
+            try:
+                re.compile(p)
+            except (re.error, TypeError):
+                continue
+            if p and p not in stored.deny_patterns and p not in added:
+                added.append(p)
+        if added:
+            # always a policy of this site's own, so a named policy shared with other sites is not changed
+            self.save_policy(replace(stored, name=f"site:{domain}:{device}",deny_patterns=stored.deny_patterns + added),
+                             domain=domain, device=device)
+        return added
 
     def start_session(self) -> str:
         sid = ulid("ses")

@@ -1,0 +1,42 @@
+# Exploration modes compared per site: every task runs once per variant below (override with --variant).
+# Checks are loose on purpose; read the "Exploration" table of the report for states, actions, seconds and tokens
+# side by side. Needs network; with no model configured, auto falls back to brute.
+#   python -m sitegraph eval eval/suites/modes.yaml --repeat 2
+name: modes
+variants:
+  brute: {exploration_mode: brute}
+  auto: {exploration_mode: auto}
+defaults:
+  navigators_per_site: 2
+  policy: {max_states: 40, budget_s: 180, max_depth: 3}
+tasks:
+  - id: books-explore
+    site: https://books.toscrape.com/
+    request: explore the site
+    max_seconds: 420
+    checks:
+      - result: states >= 5
+  - id: quotes-explore
+    site: https://quotes.toscrape.com/
+    request: explore the site
+    max_seconds: 420
+    checks:
+      - result: states >= 5
+  - id: webscraper-explore
+    site: https://webscraper.io/test-sites/e-commerce/allinone
+    request: explore the site
+    max_seconds: 420
+    checks:
+      - result: states >= 5
+  - id: internet-explore
+    site: https://the-internet.herokuapp.com/
+    request: explore the site
+    max_seconds: 420
+    checks:
+      - result: states >= 5
+  - id: scrapethis-explore
+    site: https://www.scrapethissite.com/pages/
+    request: explore the site
+    max_seconds: 420
+    checks:
+      - result: states >= 5

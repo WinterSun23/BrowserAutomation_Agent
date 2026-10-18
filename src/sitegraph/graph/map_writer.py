@@ -225,6 +225,24 @@ class MapWriter:
                el=el["gid"], type=action_type, label=label, rc=int(el.get("risk_cost", 1)), now=self.now())
         return g
 
+    def set_site_profile(self, p) -> None:
+        """Store the bootstrap's SiteProfile (agents/bootstrap.py) on the Site node, as JSON."""
+        self.q("MATCH (s:Site) SET s.profile = $p, s.profile_ts = $now", p=json.dumps(p.to_dict()), now=self.now())
+
+    def site_profile(self):
+        from ..agents.bootstrap import SiteProfile
+
+        rows = self.ro("MATCH (s:Site) WHERE s.profile IS NOT NULL RETURN s.profile LIMIT 1")
+        return SiteProfile.from_dict(json.loads(rows[0][0])) if rows else None
+
+    def mark_bootstrapped(self) -> None:
+        """A bootstrap ran (also when the model's answer was junk), so it is not tried again for this site."""
+        self.q("MATCH (s:Site) SET s.bootstrapped = true")
+
+    def bootstrapped(self) -> bool:
+        rows = self.ro("MATCH (s:Site) RETURN coalesce(s.bootstrapped, false) OR s.profile IS NOT NULL LIMIT 1")
+        return bool(rows and rows[0][0])
+
     def mark_tried(self, el_gid: str) -> None:
         self.q("MATCH (x:Element {gid:$g}) SET x.tried = true", g=el_gid)
 

@@ -12,6 +12,8 @@ from ..graph.map_writer import MapWriter
 from ..ops import Ops
 from ..schema import ensure_device_schema
 from ..normalize import domain_of, var_name
+from ..agents.navigator import is_select
+from ..risk import RISK_COST, press_risk
 from ..policy import robots_allowed
 from .core import ToolContext, ToolSpec, Toolbox
 from .graph_tools import policy_of
@@ -158,6 +160,10 @@ def observe(ctx: ToolContext, args: dict):
                     item.update(repeated_items=e.count, examples=e.sample_items[:3])
                 if e.hoverable:
                     item["hoverable"] = True
+                if e.options:
+                    item.update(options=e.options, selected=e.selected)
+                if e.checked is not None:
+                    item["checked"] = e.checked
                 listing.append(item)
     ctx.extra["elements"], ctx.extra["state"] = ids, state
     return {**_page_summary(nav, state), "elements": listing, "truncated": len(ids) > MAX_ELEMENTS}
@@ -170,14 +176,19 @@ def list_items(ctx: ToolContext, args: dict):
     return {"items": live_item_texts(get_nav(ctx).session.page, el.props())}
 
 
-def _after(ctx: ToolContext, nav, before: str | None, el, kind: str) -> dict:
+def _after(ctx: ToolContext, nav, before: str | None, el, kind: str, value=None, value_var: str | None = None,
+           props: dict | None = None) -> dict:
+    """`value` is what a select / check / press did (an option label, a checked state, a key), stored on the
+    action so it replays; typed text never is (`filled` only keeps variable names)."""
     before_key = ctx.extra.get("state_key")
     nav = get_nav(ctx)                       # the click may have led to another site
     obs = nav.observe()
     after = _write(ctx, nav, obs)
     filled = ctx.extra.pop("filled", {})
     if before and after != before and before_key == nav.key:    # an action never links two sites' graphs
-        nav.writer.write_action(before, after, el.props(), kind, ",".join(filled.values()) or None, (), list(filled))
+        g = nav.writer.write_action(before, after, props or el.props(), kind,
+                                    value_var or ",".join(filled.values()) or None, (), list(filled))
+        nav._set_edge_value("ACTION", g, value)
     ctx.extra.pop("elements", None)
     return {**_page_summary(nav, after), "page_changed": after != before,
             "next": "call observe to see the page and get fresh element ids"}
@@ -193,11 +204,11 @@ def _resolve(ctx: ToolContext, nav, el, item: str | None):
     return located
 
 
-def _acted(ctx: ToolContext, kind: str, el) -> None:
+def _acted(ctx: ToolContext, kind: str, el, value=None) -> None:
     """Remember what was done on the page (the recovery agent's actions can be learned as steps of a route). Actions
     above the policy are left out: an approval covers one action and must never be replayed automatically."""
     if policy_of(ctx).allows(el):
-        ctx.extra.setdefault("acted", []).append(f"{kind}|{el.gid}")
+        ctx.extra.setdefault("acted", []).append(f"{kind}|{el.gid}" + (f"|{value}" if value is not None else ""))
 
 
 def click(ctx: ToolContext, args: dict):
@@ -239,6 +250,109 @@ def fill(ctx: ToolContext, args: dict):
     ctx.extra.setdefault("filled", {})[el.gid] = name          # only the variable NAME is remembered, never the value
     ctx.extra.setdefault("typed", []).append(value)            # in memory only: used to scrub it out of observations
     return {"filled": el.name_sample[:60], "variable": name}
+
+
+def _norm(text) -> str:
+    return " ".join(str(text).split())
+
+
+def select_option(ctx: ToolContext, args: dict):
+    nav, el = get_nav(ctx), _element(ctx, args["element_id"])
+    if not is_select(el):
+        raise ValueError(f"element {args['element_id']} is a {el.role}, not a dropdown (<select>)")
+    wanted = _norm(args["option"])
+    option = (next((o for o in el.options if _norm(o) == wanted), None)
+              or next((o for o in el.options if _norm(o).casefold() == wanted.casefold()), None))
+    if option is None:
+        raise ValueError(f"no option '{wanted}'; the options are: {', '.join(el.options)}")
+    _guard(ctx, el)
+    located = _resolve(ctx, nav, el, None)
+    before = ctx.extra.get("state")
+    nav._act("select", located, option)
+    _acted(ctx, "select", el, option)
+    var = var_name(el.name_norm, (el.fingerprint.get("attrs") or {}).get("name"))
+    return {"selected": option, **_after(ctx, nav, before, el, "select", option, var)}
+
+
+def set_checked(ctx: ToolContext, args: dict):
+    nav, el = get_nav(ctx), _element(ctx, args["element_id"])
+    if el.role not in ("checkbox", "radio", "switch"):
+        raise ValueError(f"element {args['element_id']} is a {el.role}, not a checkbox, radio button or switch")
+    checked = args["checked"] if isinstance(args["checked"], bool) else str(args["checked"]).lower() == "true"
+    _guard(ctx, el)
+    located = _resolve(ctx, nav, el, None)
+    before = ctx.extra.get("state")
+    nav._act("check", located, str(checked))
+    _acted(ctx, "check", el, str(checked))
+    return {"checked": checked, **_after(ctx, nav, before, el, "check", str(checked))}
+
+
+PRESS_KEYS = ("Enter", "Escape", "Tab", "ArrowDown", "ArrowUp", "PageDown", "Space")
+
+
+def _form_submit_risk(ctx: ToolContext, el) -> str | None:
+    """The riskiest button of the element's form (Enter there does what submitting does), or None outside forms."""
+    if not el.in_form:
+        return None
+    buttons = [x for x in ctx.extra.get("elements", {}).values() if x.in_form == el.in_form and x.role == "button"]
+    return max((b.risk for b in buttons), key=lambda r: RISK_COST[r], default=None)
+
+
+def press(ctx: ToolContext, args: dict):
+    key = str(args.get("key") or "").strip()
+    if key not in PRESS_KEYS:
+        raise ValueError(f"key '{key}' is not allowed; use one of: {', '.join(PRESS_KEYS)}")
+    nav = get_nav(ctx)
+    el = _element(ctx, args["element_id"]) if args.get("element_id") else None
+    risk = press_risk(_form_submit_risk(ctx, el) if (el is not None and key == "Enter") else None)
+    props = el.props() if el is not None else {"name_sample": "", "href_template": None}
+    props.update(risk=risk, risk_cost=RISK_COST[risk])
+    if not policy_of(ctx).allows(props):
+        ctx.require_approval(f"pressing {key} in '{props['name_sample'][:60]}' is classified '{risk}', "
+                             "above the allowed risk level")
+    located = _resolve(ctx, nav, el, None) if el is not None else None
+    before = ctx.extra.get("state")
+    nav._act("press", located, key)
+    if el is None:            # a key on the page as a whole: nothing to record as an element's action
+        ctx.extra.pop("elements", None)
+        nav = get_nav(ctx)
+        ctx.extra["state"] = _write(ctx, nav, nav.observe())
+        return {"pressed": key, **_page_summary(nav, ctx.extra["state"]),
+                "next": "call observe to see the page and get fresh element ids"}
+    if RISK_COST[risk] <= policy_of(ctx).max_risk_cost:
+        _acted(ctx, "press", el, key)
+    return {"pressed": key, **_after(ctx, nav, before, el, "press", key, props=props)}
+
+
+def fill_inputs(ctx: ToolContext, args: dict):
+    """Set the page's search / filter controls to what the goal implies and submit (agents/inputs.py)."""
+    from dataclasses import replace
+
+    from ..agents.inputs import assign_inputs, controls_on
+
+    nav = get_nav(ctx)
+    _ensure_page(ctx, nav)
+    before = ctx.extra.get("state")
+    obs = nav.observe()
+    assignments = assign_inputs(args["goal"], controls_on(obs), ctx.llm, ctx.embedder)
+    if not assignments:
+        raise ValueError("no control on this page matches the goal (search boxes, dropdowns, checkboxes, ...)")
+    chosen, _, submit = nav.input_target(obs, assignments)
+    policy = policy_of(ctx)
+    if submit is not None and not policy.allows(submit):
+        ctx.require_approval(f"submitting with '{submit.name_sample[:60]}' is classified '{submit.risk}', above "
+                             "the allowed risk level")
+        policy = replace(policy, max_risk_cost=max(policy.max_risk_cost, submit.risk_cost))
+    ctx.extra.setdefault("typed", []).extend(str(a.value) for _, a in chosen if not isinstance(a.value, bool))
+    landed, how = nav.apply_inputs(obs, assignments, policy)
+    ctx.extra.setdefault("dirty", {})[nav.key] = nav.domain
+    ctx.extra.pop("elements", None)
+    if landed is not None:
+        ctx.extra["state"], ctx.extra["state_key"] = landed, nav.key
+    # the values are reported to the caller (they are the user's own words) but never written to the graph
+    return {"set": {a.var: a.value for _, a in chosen}, "how": how, **_page_summary(nav, landed or ""),
+            "page_changed": landed is not None and landed != before,
+            "next": "call observe to see the page and get fresh element ids"}
 
 
 def scroll(ctx: ToolContext, args: dict):
@@ -304,6 +418,29 @@ def register(box: Toolbox) -> None:
         _el_schema(value={"type": "string"}, from_secret={"type": "string"}, var_name={"type": "string"})
         | {"required": ["element_id"]},
         fill, "act", sensitive_args=("value",)))
+    box.register(ToolSpec(
+        "select_option", "Choose an option of a dropdown (observe lists its `options`), e.g. a sort order or a "
+        "category filter. Pass the option's label exactly as listed.",
+        _el_schema(option={"type": "string"}) | {"required": ["element_id", "option"]}, select_option, "act",
+        untrusted_output=True))
+    box.register(ToolSpec(
+        "set_checked", "Check or uncheck a checkbox, radio button or switch (observe shows `checked`), e.g. a "
+        "filter such as 'In stock'.",
+        _el_schema(checked={"type": "boolean"}) | {"required": ["element_id", "checked"]}, set_checked, "act",
+        untrusted_output=True))
+    box.register(ToolSpec(
+        "press", "Press a key: " + ", ".join(PRESS_KEYS) + ". With element_id the key goes to that element (Enter "
+        "in a search box without a button, Escape in a dialog); Enter in a form counts as submitting it and may need "
+        "approval.",
+        {"type": "object", "properties": {"key": {"type": "string", "enum": list(PRESS_KEYS)},
+                                          "element_id": {"type": "string"}}, "required": ["key"]},
+        press, "act", untrusted_output=True))
+    box.register(ToolSpec(
+        "fill_inputs", "Use the page's own search and filter controls for a goal: fills the search box, picks "
+        "dropdown / radio options, ticks checkboxes and sets numbers or dates the goal implies (never passwords, "
+        "e-mail, phone, payment, address or name fields), then submits. Faster than clicking around for 'find X'.",
+        {"type": "object", "properties": {"goal": {"type": "string"}}, "required": ["goal"]}, fill_inputs, "act",
+        untrusted_output=True, sensitive_args=("goal",)))
     box.register(ToolSpec(
         "scroll", "Scroll the page.", {"type": "object", "properties": {"direction": {
             "type": "string", "enum": ["up", "down", "top", "bottom"]}}, "required": ["direction"]}, scroll, "act"))

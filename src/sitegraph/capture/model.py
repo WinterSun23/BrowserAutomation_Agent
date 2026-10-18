@@ -22,6 +22,9 @@ class RawNode:
     testid: str | None
     attrs: dict
     inferred: bool = False   # no ARIA / implicit role: taken to be a button because it has a click hint or listener
+    options: list[str] = field(default_factory=list)  # <select>: the first 30 option labels
+    selected_index: int | None = None                 # <select>: the option selected when captured
+    limits: dict = field(default_factory=dict)        # inputs: min / max / step / autocomplete / group (radio name)
 
 
 @dataclass
@@ -61,6 +64,10 @@ class ElementObs:
     in_form: str | None = None
     inferred: bool = False   # a role-less element captured as a button (see extract.js)
     hoverable: bool = False  # likely to reveal a hidden menu on hover (aria-haspopup or a hidden sibling menu)
+    options: list[str] = field(default_factory=list)  # <select>: option labels (not part of identity)
+    selected: str | None = None                       # <select>: the option label selected when observed
+    checked: bool | None = None                       # checkbox / radio / switch: checked when observed
+    limits: dict = field(default_factory=dict)        # inputs: min / max / step / autocomplete / group / disabled
 
     def props(self) -> dict:
         d = asdict(self)

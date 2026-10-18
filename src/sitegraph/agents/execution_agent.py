@@ -65,8 +65,9 @@ class ExecutionAgent:
         except Exception:                                  # an empty or missing graph is not an error here
             hits = []
         if not hits:
-            return ("No known screen in the saved map matches this request. Browse by hand (observe, click, fill) or "
-                    "use explore; the pages you visit are added to the map for next time.")
+            return ("No known screen in the saved map matches this request. Call explore_toward with the goal first; "
+                    "browse by hand (observe, click, fill) only if it finds nothing. The pages you visit are added "
+                    "to the map for next time.")
         shown = "; ".join(f"{t.kind} '{(t.text or '')[:80]}'" + (f" (list item '{t.item}')" if t.item else "")
                           for t in hits)
         return (f"Known screens that may match: {shown}. Reach them with run_goal (or find_screens then plan_route) "

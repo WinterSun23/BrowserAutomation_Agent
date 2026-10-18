@@ -85,11 +85,15 @@ class Ops:
                pcs=list(pre_cstates), now=now_ms(), prio=float(priority))
         return g
 
-    def next_item(self, scope: str, agent_id: str, graph: str, ttl_ms: int = 120000) -> tuple[dict | None, bool]:
-        """Claim the next open item. Returns (item, others_hold_open_items)."""
+    def next_item(self, scope: str, agent_id: str, graph: str, ttl_ms: int = 120000,
+                  min_priority: float | None = None) -> tuple[dict | None, bool]:
+        """Claim the next open item (with `min_priority`, only items of at least that priority: guided rounds).
+        Returns (item, others_hold_open_items)."""
         rows = self.q("MATCH (w:WorkItem {scope:$s, status:'open'}) "
+                      "WHERE $mp IS NULL OR coalesce(w.priority, 0.0) >= $mp "
                       "RETURN w.gid, w.kind, w.url, w.depth, w.el_gid, w.pre, w.pre_cstates "
-                      "ORDER BY coalesce(w.priority, 0.0) DESC, w.depth, w.created, w.gid LIMIT 50", s=scope)
+                      "ORDER BY coalesce(w.priority, 0.0) DESC, w.depth, w.created, w.gid LIMIT 50", s=scope,
+                      mp=None if min_priority is None else float(min_priority))
         if not rows:
             return None, False
         for g, kind, url, depth, el, pre, pcs in rows:
@@ -100,6 +104,38 @@ class Ops:
                             pre_cstates=tuple(pcs or ())), True
             self.release(g, agent_id)  # finished by someone else between our read and our claim
         return None, True
+
+    def open_items(self, scope: str, limit: int = 5000) -> list[dict]:
+        """Open work items of a scope, most promising first (what guided exploration groups into a frontier)."""
+        rows = self.q("MATCH (w:WorkItem {scope:$s, status:'open'}) "
+                      "RETURN w.gid, w.kind, w.url, w.depth, w.el_gid, coalesce(w.priority, 0.0), w.pre "
+                      "ORDER BY coalesce(w.priority, 0.0) DESC, w.depth, w.created, w.gid LIMIT $n", s=scope, n=limit)
+        return [dict(gid=r[0], kind=r[1], url=r[2], depth=r[3], el_gid=r[4], priority=r[5], pre=tuple(r[6] or ()))
+                for r in rows]
+
+    def set_priorities(self, gids: list[str], priority: float) -> None:
+        if gids:
+            self.q("MATCH (w:WorkItem) WHERE w.gid IN $g AND w.status = 'open' SET w.priority = $p",
+                   g=list(gids), p=float(priority))
+
+    def bump_priorities(self, gids: list[str], amount: float) -> None:
+        if gids:
+            self.q("MATCH (w:WorkItem) WHERE w.gid IN $g AND w.status = 'open' "
+                   "SET w.priority = coalesce(w.priority, 0.0) + $a", g=list(gids), a=float(amount))
+
+    def close_items(self, gids: list[str], reason: str) -> None:
+        """Mark open items done without working on them (skipped by the planner)."""
+        if gids:
+            self.q("MATCH (w:WorkItem) WHERE w.gid IN $g AND w.status = 'open' SET w.status = 'done', w.error = $e",
+                   g=list(gids), e=reason)
+
+    def reseed(self, scope: str, graph: str, url: str, priority: float = 100.0) -> str:
+        """Queue `url` as a page item of depth 0 (or bring an open one back to depth 0) with a high priority, so the
+        next round starts there with its full depth budget. A page already done is not loaded again."""
+        g = self.add_item(scope, graph, "page", url, 0, priority=priority)
+        self.q("MATCH (w:WorkItem {gid:$g}) WHERE w.status = 'open' SET w.depth = 0, w.priority = $p",
+               g=g, p=float(priority))
+        return g
 
     def backlog(self, scope: str) -> int:
         """Open work items nobody holds a claim on (what an extra explorer could start on right now)."""
