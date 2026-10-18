@@ -19,6 +19,9 @@ Site: {domain} (device: {device}). Safety level: only actions up to '{max_risk}'
 How to work:
 - Prefer the saved site map: use find_screens and run_goal (or plan_route then run_route) to reach a screen. They are
   cheaper and more reliable than clicking by hand. If the site is unknown or a screen cannot be found, use explore_toward (only as far as the goal needs) or explore (the whole site).
+- For dropdowns use select_option (with an option observe lists), for checkboxes / radios set_checked, for keys
+  press (Enter in a search box without a button, Escape to close a dialog); to search or filter for a goal, try
+  fill_inputs first.
 - To act on a page by hand: observe first, then use the element ids it returns (they change whenever the page changes, so
   observe again after any click). For a repeated list, use list_items and pass the entry's text as `item`.
 - When a tool answers with needs_approval, stop and tell the user plainly what the action is and why it needs approval.
@@ -37,8 +40,11 @@ How to work:
 
 class ExecutionAgent:
     def __init__(self, settings, store, embedder, llm, blobs, site: SiteInfo, profile=None, chat_llm=None,
-                 policy: ExplorationPolicy | None = None):
+                 policy: ExplorationPolicy | None = None, orchestrator=None):
+        """With an `orchestrator`, every request first goes through `Orchestrator.handle` (the same plan -> run ->
+        verify path as `run`); the tool loop starts only for chat messages and when a planned step fails."""
         self.settings, self.site = settings, site
+        self.orchestrator, self.last_result = orchestrator, None
         policy = policy or (profile.policy_for(site.domain, site.device) if profile else ExplorationPolicy())
         self.ctx = ToolContext(settings=settings, store=store, key=site.key, domain=site.domain, embedder=embedder,
                                llm=llm, policy=policy, profile=profile, device=site.device, blobs=blobs)
@@ -84,11 +90,52 @@ class ExecutionAgent:
             except Exception as exc:                       # learning is a bonus: never fail the request over it
                 logging.getLogger(__name__).warning("could not curate %s: %s", key, exc)
 
+    @staticmethod
+    def _summary(rr) -> str:
+        if rr.answer:
+            return rr.answer
+        lines = []
+        for r in rr.steps:
+            if r.get("kind") == "explore":
+                lines.append(f"Explored: {r.get('states', 0)} screens, {r.get('actions', 0)} actions.")
+            elif r.get("kind") == "demo":
+                lines.append("Made the demo: " + ", ".join(f"{f} {p}" for f, p in r.get("renders", [])))
+            else:
+                lines.append(f"{r.get('kind')}: done.")
+        return " ".join(lines) or "Done."
+
+    @staticmethod
+    def _failure_note(rr, page: dict | None) -> str:
+        done = []
+        for r in rr.steps:
+            st = rr.plan.steps[r["step"]] if r.get("step") is not None and r["step"] < len(rr.plan.steps) else None
+            goal = st.goal if st else ""
+            why = r.get("error") or r.get("explanation") or (r.get("verified") or {}).get("reason") or ""
+            done.append(f"step {r.get('step', 0) + 1} {r.get('kind')} '{goal}' -> {r.get('status', r.get('kind'))}"
+                        + (f" ({str(why)[:200]})" if why else ""))
+        where = f" The plan ended on {page['url']}." if page and page.get("url") else ""
+        return ("The saved map was tried first and a step failed: " + "; ".join(done) + "." + where +
+                " Finish the request another way (explore_toward the goal, then browse by hand), or tell the user "
+                "plainly what is blocking.")
+
     def ask(self, text: str, on_event: Callable[[dict], None] | None = None) -> AgentRun:
         self.ctx.extra["request_text"] = text         # lets click choose a list entry the request names
-        hint = self.map_hint(text)
-        run = self.loop.run(f"{text}\n\n[Automatic map lookup, not written by the user] {hint}", self.history,
-                            on_event)
+        note = None
+        if self.orchestrator is not None:
+            rr = self.orchestrator.handle(text, self.site)
+            self.last_result = rr
+            if rr.status == "done":
+                answer = self._summary(rr)
+                self.history += [ChatMessage("user", content=text), ChatMessage("assistant", content=answer)]
+                (on_event or (lambda e: None))({"type": "assistant", "content": answer})
+                if self.profile and self.session_id:
+                    self.profile.log_request(self.session_id, text, "done", self.site.key, kind="chat")
+                return AgentRun("done", answer=answer, messages=self.history)
+            if rr.status != "chat":
+                note = self._failure_note(rr, self.orchestrator.last_page)
+        hint = note or self.map_hint(text)
+        label = "Automatic plan run" if note else "Automatic map lookup"
+        run = self.loop.run(f"{text}\n\n[{label}, not written by the user] {hint}", self.history, on_event)
         if run.status != "needs_approval":
             self._learn()
         if self.profile and self.session_id:

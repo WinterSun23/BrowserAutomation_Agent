@@ -164,13 +164,11 @@ def run(args: argparse.Namespace) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
     site = orch.register_site(args.site, args.device)
-    ops = Ops(store, settings.uid, site.domain)
     failed = False
     orch.on_intent = lambda i: print(f"-> {i['kind']} (goal: {i['goal']}; chosen by {i['source']})", file=sys.stderr)
     for text in args.requests:
         print(f"\n== {text}", file=sys.stderr)
-        task = ops.create_task("chat", text, device=args.device)
-        result = orch.run_task(task, text, site, args.navigators, kind=args.kind, rescan=args.rescan)
+        result = orch.handle(text, site, args.navigators, kind=args.kind, rescan=args.rescan).flat()
         print(json.dumps(result, indent=2, default=str))
         failed = failed or result.get("kind") == "error"
     print(f"\nGraphs: {site.key}, {site.ops_key}, u:{settings.uid}:profile   Files: {settings.data_dir}",
@@ -212,7 +210,8 @@ def chat(args: argparse.Namespace, input_fn=None, write=print) -> int:
         return 2
     site = orch.register_site(args.site, args.device)
     use_agent = can_call_tools(llm) and not args.no_agent
-    agent = ExecutionAgent(settings, store, embedder, llm, blobs, site, orch.profile) if use_agent else None
+    agent = (ExecutionAgent(settings, store, embedder, llm, blobs, site, orch.profile, orchestrator=orch)
+             if use_agent else None)
     if agent is not None:
         agent.ctx.extra["orchestrator"] = orch            # lets the agent queue background tasks (submit_task)
     if not use_agent:
@@ -232,8 +231,7 @@ def chat(args: argparse.Namespace, input_fn=None, write=print) -> int:
             if line in ("/quit", "/exit"):
                 break
             if agent is None:
-                task = ops.create_task("chat", line, device=args.device)
-                write(json.dumps(orch.run_task(task, line, site), indent=2, default=str))
+                write(json.dumps(orch.handle(line, site).flat(), indent=2, default=str))
                 continue
             run = converse(agent, line, input_fn, write)
             write(f"\n{run.answer or '(no answer: ' + run.status + ')'}")

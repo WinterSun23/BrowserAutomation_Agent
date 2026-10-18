@@ -5,7 +5,8 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass, field, replace
 
 from ..browser.session import BrowserSession
 from ..db import device_key, ops_key
@@ -28,6 +29,8 @@ from ..versions import ALGO_VERSION
 from ..policy import ExplorationPolicy
 from .bootstrap import bootstrap
 from .curator import Curator
+from .planner import Plan, PlanStep, Planner, input_vars
+from .verify import verify
 from .frontier import FrontierChoice, choice_key, choose_frontier, group_frontier, representatives, skipped_groups
 from .escalation import make_curator_escalation, make_escalation
 from .factory import make_navigator
@@ -95,6 +98,40 @@ def _nothing_new(result: dict) -> dict:
         return {}
     return {"note": f"nothing new to explore: {result['skipped_tried']} clickable elements were already tried by earlier "
                     "runs. Use --rescan (or ask to explore again with rescan) to visit them again."}
+
+
+@dataclass
+class RequestResult:
+    """One request handled end to end: its plan, each step's run_task result (with its verdict), the outcome."""
+    text: str
+    plan: Plan
+    steps: list[dict] = field(default_factory=list)
+    status: str = "done"                 # done | partial | failed | chat (nothing to do on the site)
+    answer: str | None = None
+    failed_step: int | None = None
+
+    def flat(self) -> dict:
+        """The printable / checkable form: a one-step plan is that step's result (as `run_task` gave it) plus the
+        plan and the overall status; a longer plan lists its steps."""
+        out = dict(self.steps[0]) if len(self.steps) == 1 else {"kind": "plan" if self.steps else "chat",
+                                                                   "steps": self.steps}
+        out.update(plan=[asdict(s) for s in self.plan.steps], status=self.status, plan_source=self.plan.source)
+        if self.answer is not None:
+            out["answer"] = self.answer
+        if self.failed_step is not None:
+            out["failed_step"] = self.failed_step
+        return out
+
+
+def step_status(result: dict) -> str:
+    """done, or why a step did not succeed (its run_task status, 'failed' for errors and unconfirmed outcomes)."""
+    if result.get("kind") == "error":
+        return "failed"
+    verdict = result.get("verified")
+    status = result.get("status") or "done"
+    if status == "done" and verdict is not None and not verdict.get("ok"):
+        return "failed"
+    return status
 
 
 def _clamp_agents(value) -> int | None:
@@ -676,10 +713,54 @@ class Orchestrator:
         merged.errors += len(errors)
         return merged, agents
 
+    def handle(self, text: str, site: SiteInfo, navigators: int | None = None, kind: str | None = None,
+               rescan: bool = False) -> RequestResult:
+        """The one request path for `run`, `chat` and the eval harness: plan -> run each step -> verify. Stops at
+        the first step that does not succeed. A forced `kind` is a one-step plan. Steps that need the site share one
+        browser, so an `ask` after a navigation is answered on the page that navigation reached."""
+        self.last_page = None
+        if kind:
+            plan = Plan([PlanStep(kind, text, {}, None)], "override")
+        else:
+            try:
+                inputs = input_vars(self.store, site.key)
+            except Exception:
+                inputs = []
+            try:
+                site_profile = MapWriter(self.store, site.key, self.s).site_profile()
+            except Exception:
+                site_profile = None
+            plan = Planner(self.llm, self.profile, site_profile, self.s.plan_max_steps).plan(text, inputs)
+        actionable = [s for s in plan.steps if s.kind != "chat"]
+        if not actionable:
+            return RequestResult(text, plan, [], "chat")
+        ops = Ops(self.store, self.s.uid, site.domain)
+        shared = len(actionable) > 1 and any(s.kind in ("automate", "ask") for s in actionable)
+        steps: list[dict] = []
+        answer = None
+        with (BrowserSession(site.device, self.s.headless) if shared else nullcontext(None)) as sess:
+            for i, st in enumerate(actionable):
+                single = len(actionable) == 1
+                step_text = text if single or st.kind == "ask" else " ".join(x for x in (st.goal, st.item) if x)
+                here = (st.kind == "ask" and bool(steps) and steps[-1].get("kind") == "automate"
+                        and step_status(steps[-1]) == "done")
+                intent = {"kind": st.kind, "goal": st.goal, "params": dict(st.params or {}), "item": st.item,
+                          "source": plan.source, "here": here}
+                task = ops.create_task("chat", step_text, device=site.device)
+                r = self.run_task(task, step_text, site, navigators, rescan=rescan, intent=intent, session=sess)
+                r["step"] = i
+                steps.append(r)
+                if r.get("kind") in ("ask", "automate") and r.get("explanation"):
+                    answer = r["explanation"]
+                if step_status(r) != "done":
+                    return RequestResult(text, plan, steps, "partial" if i else "failed", answer, i)
+        return RequestResult(text, plan, steps, "done", answer, None)
+
     def run_task(self, task_id: str, text: str, site: SiteInfo, navigators: int | None = None,
-                 kind: str | None = None, rescan: bool = False) -> dict:
-        """`kind` skips the classification and forces that kind of request; `rescan` makes an exploration visit
-        elements that earlier runs already tried."""
+                 kind: str | None = None, rescan: bool = False, intent: dict | None = None, session=None) -> dict:
+        """One step. `intent` (from a plan) skips the classification; `kind` forces a kind of request; `rescan`
+        makes an exploration visit elements that earlier runs already tried; `session` is a browser to use (and
+        leave open) instead of opening one; with `intent['here']` an ask is answered on that session's page."""
         ops = Ops(self.store, self.s.uid, site.domain)
         agent = f"navigator-{site.device}"
         ops.register_agent(agent, "navigator", site.device)
@@ -689,7 +770,11 @@ class Orchestrator:
         policy = self.profile.policy_for(site.domain, site.device)
         secrets = lambda var: self.profile.secret_for(var, site.domain)  # noqa: E731
         try:
-            if kind:
+            if intent is not None:
+                intent = {**intent, "source": intent.get("source") or "plan"}
+                if intent["kind"] not in KINDS:
+                    raise ValueError(f"unknown request kind '{intent['kind']}' (one of {', '.join(KINDS)})")
+            elif kind:
                 if kind not in KINDS:
                     raise ValueError(f"unknown request kind '{kind}' (one of {', '.join(KINDS)})")
                 intent = {"kind": kind, "goal": text, "params": {}, "source": "override"}
@@ -734,14 +819,16 @@ class Orchestrator:
                 result = self.explore(site, policy, task_id, n)
                 result.update(_nothing_new(result), policy=policy.to_dict())
             else:
+                here = bool(intent.get("here")) and session is not None
                 searched = (self.explore_toward(site, intent["goal"], text, policy, task_id, navigators)
-                            if self.s.goal_explore and kind in ("automate", "ask") else None)
+                            if self.s.goal_explore and kind in ("automate", "ask") and not here else None)
                 git = GitOps(self.store, self.s.uid, site.domain, self.s) if self.s.use_git else None
                 writer = git.main_recorder(site.device) if git else None
                 if git:
                     agent = f"executor-{site.device}"
                     ops.register_agent(agent, "executor", site.device)
-                with BrowserSession(site.device, self.s.headless) as sess:
+                with (nullcontext(session) if session is not None
+                      else BrowserSession(site.device, self.s.headless)) as sess:
                     nav = make_navigator(self.store, site.key, site.domain, sess, self.s, self.embedder, self.llm,
                                          blobs=self.blobs, events=self.events, agent_id=agent, task_id=task_id,
                                          writer=writer, secrets=secrets, notes=self._note_fn(site, agent),
@@ -749,21 +836,40 @@ class Orchestrator:
                                                                   self.embedder, self.llm, self.blobs, site.device))
                     if entry_state(self.store, site.key) is None:
                         raise ValueError("this site has not been explored yet: ask me to explore it first")
-                    res = nav.execute_goal(intent["goal"], intent.get("params") or {}, policy, intent.get("item"),
-                                           request_text=text)
-                    try:
-                        self.last_page = {"url": sess.page.url, "text": sess.page.inner_text("body")[:20000]}
-                    except Exception:
-                        self.last_page = None
-                    self._last_run[site.key] = res.run_gid
+                    res = None if here else nav.execute_goal(
+                        intent["goal"], intent.get("params") or {}, policy, intent.get("item"), request_text=text)
+                    self._remember_page(sess)
+                    page_text = (self.last_page or {}).get("text", "")
+                    if res is not None:
+                        self._last_run[site.key] = res.run_gid
+                    reached = here or res.status == "done"
                     if kind == "ask":
-                        result = {"kind": kind, "status": res.status, "run": res.run_gid,
-                                  "explanation": self._answer_from_page(nav, sess, text)}
+                        answer = self._answer_from_page(nav, sess, text)
+                        verdict = verify(text, "ask", reached, page_text, self.llm, answer=answer)
+                        result = {"kind": kind, "status": "done" if here else res.status,
+                                  "run": res.run_gid if res else None, "explanation": answer,
+                                  "verified": verdict.to_dict()}
+                        if not verdict.ok:
+                            result["unconfirmed_answer"] = answer
+                            result["explanation"] = f"Could not confirm the answer on the page ({verdict.reason})."
                     else:
+                        verdict = verify(text, "automate", reached, page_text, self.llm)
+                        replanned = False
+                        if not verdict.ok and reached and verdict.how == "model":
+                            # the screen was reached but the page does not fulfil the request: one more try
+                            replanned = True
+                            res = nav.execute_goal(f"{intent['goal']} (not the screen reached before: {verdict.reason})",
+                                                   intent.get("params") or {}, policy, intent.get("item"),
+                                                   request_text=text)
+                            self._remember_page(sess)
+                            verdict = verify(text, "automate", res.status == "done",
+                                             (self.last_page or {}).get("text", ""), self.llm)
+                            self._last_run[site.key] = res.run_gid
                         Curator(self.store, site.key, self.s, self.embedder, self.llm).annotate()
                         explanation = (self.explain_with_blame(site, res.route) if git else "") or res.explanation
                         result = {"kind": "automate", "status": res.status, "explanation": explanation,
-                                  "heals": res.heals, "replans": res.replans, "run": res.run_gid}
+                                  "heals": res.heals, "replans": res.replans, "run": res.run_gid,
+                                  "verified": verdict.to_dict(), "replanned_after_verify": replanned}
                     if searched:
                         result["goal_explore"] = searched
                     if git:
@@ -782,6 +888,12 @@ class Orchestrator:
             self.profile.log_request(self.session_id, text, "failed", site.key, kind="error")
             self.events.publish(self.s.uid, {"type": "task", "task": task_id, "status": "failed", "result": result})
             return result
+
+    def _remember_page(self, sess) -> None:
+        try:
+            self.last_page = {"url": sess.page.url, "text": sess.page.inner_text("body")[:20000]}
+        except Exception:
+            self.last_page = None
 
     def explain_with_blame(self, site: SiteInfo, route) -> str:
         """The route explanation, each step annotated with the agent and commit that first discovered it."""

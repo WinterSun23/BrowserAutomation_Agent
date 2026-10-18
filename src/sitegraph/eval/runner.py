@@ -163,16 +163,14 @@ def run_task_once(task: EvalTask, variant: str, rep: int, s: Settings, store, em
             box["key"] = site.key
             ops = Ops(store, s.uid, site.domain)
             for text in task.setup:
-                res = orch.run_task(ops.create_task("eval", text, device=site.device), text, site)
+                res = orch.handle(text, site).flat()
                 if res.get("kind") == "error":
                     box["setup_error"] = f"setup {text!r}: {res.get('error')}"
                     return
             box["states0"] = _count(store, site.key, "MATCH (n:State) RETURN count(n)")
             box["actions0"] = _count(store, site.key, "MATCH ()-[a:ACTION]->() RETURN count(a)")
             orch.last_page = None
-            # Task 14 switches this to Orchestrator.handle
-            box["result"] = orch.run_task(ops.create_task("eval", task.request, device=site.device), task.request,
-                                          site)
+            box["result"] = orch.handle(task.request, site).flat()
             box["last_page"] = orch.last_page
         except Exception as exc:  # noqa: BLE001 - recorded as the run's error
             box["exception"] = f"{type(exc).__name__}: {exc}"

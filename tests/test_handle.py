@@ -105,7 +105,7 @@ def test_a_chat_message_is_answered_without_touching_the_site(shop):
 def test_a_partial_plan_reports_what_was_done(shop):
     o, site = _orch(shop, _llm(CART + [{"kind": "automate", "goal": "zzqx vvkk"}]))
     rr = o.handle("open the cart and then zzqx", site)
-    assert rr.status == "partial" and rr.failed_step == 1 and len(rr.steps) == 2
+    assert rr.status == "partial" and rr.failed_step == 1 and len(rr.steps) == 2, rr.steps
     assert rr.steps[0]["status"] == "done" and rr.steps[1]["status"] == "no_target"
 
 
