@@ -10,7 +10,6 @@ SiteGraph is a Python agent system that explores a public website into a **Falko
 > - **Built and tested with scripted models:** the engine, the graph with git-style history, the agents and the MCP server.
 > - **Run live** on books.toscrape.com and the-internet.herokuapp.com: through the command line, through MCP with Claude as the agent, and with a small local model.
 > - **The web console lives in a separate repository** (`BrowserAgent-Frontend`, a WebSocket bridge that imports this package). This repository has no web server.
-> - **Not built:** repair after a site redesign, and the other items under [Roadmap](#roadmap-not-built).
 
 ## Demo video
 
@@ -324,58 +323,15 @@ Integration and browser tests are skipped (not failed) when FalkorDB is not runn
 
 ## Known limits
 
-**Proven live so far, and what isn't**
-- **Live runs:** books.toscrape.com and the-internet.herokuapp.com, driven through the command line, through MCP with Claude as the agent, and with `qwen3:4b` (tool calling, no vision). What happened:
-  - Mapping, routing to a named category, opening the cheapest book on a page, refusing to leave the site without approval and refusing to pretend "checkout" exists all behaved correctly.
-  - `make_demo` over MCP failed on the first run (Playwright in an asyncio loop). It is fixed in code (one Playwright instance per thread) but has not been re-run live.
-- **Never run against a real vision model:** the vision paths (the Demo agent reviewing previews, Navigator recovery from a screenshot, vision healing).
-- **No full test-suite run or recorded evaluation yet** for the model-driven orchestration (planner, site profile, guided exploration, goal search, verify step). The evaluation harness (`python -m sitegraph eval`, see `eval/README.md`) exists for exactly this.
-
-**Browser actions**
-- **Supported:**
-  - click, hover, and typing into fields (stored as variables);
-  - choosing a dropdown option, checking checkboxes, radio buttons and switches;
-  - the keys Enter, Escape, Tab, Space, arrow up and down, and Page Down;
-  - using a site's own search and filter controls (text, number, range, date);
-  - scrolling to load lazy content;
-  - clickable elements without an ARIA role, found through the page's event listeners (Chromium only).
-- **Not supported:** drag and drop, sliders moved by dragging, touch gestures, scrolling inside virtualised lists (entries removed as you scroll), and file uploads.
-- **Pages behind a login are skipped:** a page with a password field gets a note and is not explored. Only public pages are in scope.
-
-**Exploration**
-- **Slow per step:** every click path is replayed from a fresh page load. Guided exploration and goal search reduce *how much* is explored, not the cost of each step.
-- **Late elements:** an element that appears late (a timer, a banner) is stored in the map but explored only by a later run.
-- **Shared page types:** one screen stands for every entry of a list (all category pages, all book pages), and its stored title is the entry seen last. Tools and demo captions name the chosen entry instead, but raw graph queries show the stored title.
-
-**Agents**
-- **Approvals during recovery:** a recovery that needs your approval (for example a banner whose only button is destructive) cannot ask you mid-run. The step fails and the reason is recorded.
-- **Learned steps:** what the recovery agent did to get past an obstacle is saved on that route step and replayed when the obstacle is present, so later runs need no model. Only actions within the allowed risk level are learned, and replays find elements by name only. An obstacle whose button changes name is recovered from again.
-- **Memory:**
-  - What is kept: memories you ask for, a summary of each chat session, and your recent memories and preferences included in the chat agent's instructions.
-  - What is learned automatically: only the preferred demo format, after three demos with the same choice.
-  - The fixed pipeline does not read memories.
-- **Without a model:** requests are routed by keywords, screens are summarised by their titles, and exploration is always brute-force. Requests that name an item ("open the Travel category") still work, but paraphrases do not.
-
-**Environment**
-- **FalkorDB 4.22.1 is required.** 6.x changed the full-text index API.
-- **Restart crash:** on 4.22.1, FalkorDB twice crashed on restart while replaying its append-only log after many branch copies (`GRAPH.COPY`). The fixes are to recreate the container, or to run with snapshot-only persistence (`--appendonly no`), which can lose up to 60 seconds of writes.
-- **Windows browser startup:** Playwright's own windowed Chromium can fail to start ("side-by-side configuration" error). Set `SITEGRAPH_BROWSER_CHANNEL=chrome` (or `msedge`) to use the installed browser instead. Headless runs are not affected.
-- **No web server here:** `python -m sitegraph serve` only prints a message; the web API is the bridge in the front-end repository.
-
-## Roadmap (not built)
-
-**Designed in the v2 plan, not built yet:**
-- **Repair after a redesign:**
-  - drift detection and a quarantine sweep for actions that keep failing;
-  - a Repairer that re-crawls changed pages on a branch, maps old elements to new ones and rewrites saved workflows;
-  - simulated redesigns to test this, with A/B comparison.
-- **UX report:** dead ends, unreachable screens, bottlenecks, inconsistent components.
-- **Docs generator:** user documentation from saved workflows.
-- **Benchmark against other browser agents.** SiteGraph's own evaluation harness exists; comparison with other agents and the "perturbed site" mode do not.
-- **Publishing:** merging a private map into a shared public map.
-
-**Already built** (earlier versions of this list included them):
-- git-style branches, merges, tags, revert and blame for the graph;
-- multi-device runs;
-- the semantic graph across sites and devices;
-- the MCP server.
+- **Limited live testing.** Runs on real sites so far are books.toscrape.com and the-internet.herokuapp.com, with Claude (through MCP) and a small local model. The vision features have not been tried with a real vision model.
+- **Some browser actions are missing:** drag and drop, sliders, touch gestures, file uploads and lists that remove entries as you scroll.
+- **Public pages only.** Pages behind a login are skipped.
+- **Exploration is slow on large sites:** every path is replayed from a fresh page load.
+- **Late-appearing elements** (timers, banners) are explored only on a later run.
+- **No approvals during recovery.** If getting past an obstacle needs your approval, the step fails instead of asking you.
+- **Memory is basic.** It keeps what you ask it to remember and summarises each chat session, but learns little on its own.
+- **Weaker without a model.** Requests are matched by keywords, so they must name what they want.
+- **Setup:**
+  - FalkorDB must be version 4.22.1.
+  - On Windows, if the visible browser does not start, set `SITEGRAPH_BROWSER_CHANNEL=chrome`.
+  - The web console is a separate project; this repository has no web server.
