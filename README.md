@@ -56,151 +56,226 @@ Without `LLM_API_KEY` the system still runs with built-in fallbacks (keyword rou
 
 Config lives in `config.yaml`; a gitignored `.env` file and then real environment variables (`LLM_MODEL`, `LLM_API_BASE`, `LLM_API_KEY`, `SITEGRAPH_*`) override it. Model calls retry rate limits up to 3 times; a call that still fails falls back to the built-in default and logs a warning.
 
-## Graph data model
+## The graph
 
-One FalkorDB graph per **user x site x device** holds everything that must be traversed together; separate graphs exist only for isolation.
+SiteGraph stores a website as a state machine:
+- **screens** are nodes;
+- **the things a user does to move between screens** (click, hover, submit a form) are edges.
 
-```
-FalkorDB instance
- u:{uid}:site:{domain}:{device}   DEVICE GRAPH   map + semantics + workflows + runs + demos
- u:{uid}:ops:{domain}             OPS GRAPH      agents, tasks, claims, shared exploration work items
- u:{uid}:profile                  PROFILE GRAPH  preferences, policies, sessions, memory, site index
-```
+The agent never plans from the live page alone. It plans on this map, then checks the plan in the browser.
 
-Key design rules: edges are actions and paths are plans; anything an algorithm must include or exclude is a **label or relationship type** (algorithms cannot filter by property); every node has a deterministic content hash `gid` (same screen found twice = same node, merges are idempotent); precomputed algorithm scores sit on nodes so an agent reads them cheaply; typed input values are never stored.
+### Where the graphs live
+
+All graphs sit in one FalkorDB instance and are named by owner, site and device:
+
+| Graph key | Contents |
+|---|---|
+| `u:{uid}:site:{domain}:{device}` | **Device graph**: the map of one site on one device type, plus everything learned about it (summaries, workflows, run history, demos). Most of this section is about this graph. |
+| `…:{device}@br:{agent}-{8hex}` | **Branch**: a copy of the device graph that one explorer writes to. The Curator merges it back. |
+| `…:{device}@tag:{name}`, `…@at:{8hex}` | **Tag**: a named snapshot. **Checkout**: the graph as it was at one commit. |
+| `u:{uid}:ops:{domain}` | **Ops graph**: agents, tasks, leases, the shared exploration queue, and the commit history of the site's device graphs. |
+| `u:{uid}:profile` | **Profile graph**: one user's preferences, exploration policies, memories, sessions, known sites and references to stored secrets. The secret values themselves live in the OS keyring, never in a graph. |
+| `u:{uid}:semantic` | **Semantic graph**: patterns shared across sites and devices. Rebuilt from the device graphs and never edited by hand. |
+
+### The device graph
 
 ```mermaid
 flowchart LR
-  subgraph Map
-    Page -->|HAS_STATE| State
-    Component -->|HAS_CSTATE| ComponentState
-    State -->|COMPOSED_OF| ComponentState
-    ComponentState -->|CONTAINS| Element
-    State -->|ACTION| State
-    ComponentState -->|TRANSITION| ComponentState
-  end
-  subgraph Semantics
-    Intent -->|FULFILLED_BY| State
-    Intent -->|FULFILLED_BY| Workflow
-  end
-  subgraph Procedural
-    WStep -->|STEP_OF| Workflow
-    WStep -->|FROM| State
-    WStep -->|ON| Element
-  end
-  subgraph Activity
-    Step -->|IN_RUN| Run
-    Step -->|NEXT| Step
-    Step -->|FROM / TO| State
-    Run -->|EXECUTED| Workflow
-    Observation -->|DURING| Step
-    Observation -->|OF| Element
-  end
-  subgraph Demo
-    DemoRequest -->|PRODUCED| Storyboard
-    Storyboard -->|BASED_ON| Workflow
-    Shot -->|IN_STORYBOARD| Storyboard
-    Shot -->|SHOWS| State
-    Shot -->|FROM_STEP| Step
-    Storyboard -->|RENDERED_AS| Render
-  end
+  Page -->|HAS_STATE| State
+  State -->|ACTION| State
+  State -->|COMPOSED_OF| CS[ComponentState]
+  Component -->|HAS_CSTATE| CS
+  CS -->|CONTAINS| Element
+  CS -->|TRANSITION| CS
+  Intent -->|FULFILLED_BY| State
+  Intent -->|FULFILLED_BY| Workflow
+  WStep -->|STEP_OF| Workflow
+  WStep -->|ON| Element
+  Step -->|IN_RUN| Run
+  Step -->|FROM / TO| State
+  State -. "ACTION.el_gid" .-> Element
 ```
 
-### Device graph nodes
+How to read it:
+- The map layer is `Page → State → ComponentState → Element`.
+- `ACTION` edges between States are the moves.
+- The dotted line is a property, not an edge: every `ACTION` names the `Element` it uses in `el_gid`.
+- Intents, workflows and the run log hang off the map.
+- Demo nodes are listed below but left out of the diagram.
 
-| Label | Key properties | Purpose |
+#### Identity: when two observations are the same node
+
+Every node has a `gid` = prefix + first 16 hex characters of SHA-1 over its identity parts. The same screen seen twice, or by two agents, produces the same gid, so writes are idempotent `MERGE`s.
+
+| Node | Identity parts |
+|---|---|
+| `Page` | domain + **URL template**: the path with id-like segments (numbers, UUIDs, long hex strings, slugs, `name_123`) replaced by `:id`, plus the sorted query-string *keys* (values dropped). `/catalogue/a-light-in-the-attic_1000/index.html` → `/catalogue/:id/index.html`. |
+| `Component` | role of the region + its accessible name + its generic CSS path. Whole-page and `main` regions use the URL template instead. |
+| `ComponentState` | the component + a hash of its elements' `role\|name` keys. |
+| `State` | the page + the sorted list of its *persistent* component states. Menus, tooltips, tab panels and alerts are ephemeral and do not count, so opening a menu does not create a new screen. |
+| `Element` | the component + role + key (the link's URL template, else its normalised name) + its index among identical siblings. |
+| `ACTION` | source State + Element + action type + input variable name + target State. |
+
+Three refinements keep the map small:
+- **Repeated lists** (4 or more items with the same structure and the same link pattern) become one *template* Element. It keeps the item count and up to 60 sample texts. "Open the Travel category" therefore uses the same edge as "open Mystery", with the item chosen at run time.
+- **Coarse identity** (`state_identity: coarse`): content regions (`main`, lists, feeds, grids, tables, articles) contribute role counts instead of names. A result list whose entries change stays one State.
+- **Near-duplicates**: an observation is folded into an existing State of the same page when it has the same modal dialogs open and its tokens are ≥ 85% similar (Jaccard). The new gid is kept in `State.aliases`.
+
+#### Nodes
+
+| Label | Definition | Main properties |
 |---|---|---|
-| `Page` | `url_template`, `example_urls`, `title` | where am I (e.g. `/product.html?id`) |
-| `State` (+ `:Entry`, `:Frontier`, `:Blocking`) | `tokens`, `aliases`, `summary`, `emb`, `untried_count`, `pagerank`, `betweenness`, `community`, `demo_score` | the node the planner moves between |
-| `Component` / `ComponentState` | `kind`, `blocking`, `ephemeral`; `name` (e.g. closed/open), `aria_state` | reusable region and its small states (a menu open vs closed) without multiplying States |
-| `Element` (+ template data) | `role`, `name_sample`, `name_norm`, `locators[]`, `fingerprint`, `risk`, `risk_cost`, `tried`, `volatile`, `is_template`, `count` | the thing you click; multi-locator list and fingerprint give runtime healing |
-| `Intent`, `Feature` | `text`/`name`, `emb` | natural-language goals; communities of states for coverage |
-| `Workflow`, `WStep` | `name`, `params`, `run_count`, `success_rate`, `demo_score`; `order`, `action_gid`, `value_var` | reusable parameterised automations |
-| `Run`, `Step`, `Observation` | `kind`, `status`; `ok`, `healed`, `latency_ms`; `kind` (heal, unexpected_state) | append-only activity log (last 100 runs kept in full) |
-| `DemoRequest`, `Storyboard`, `Shot`, `Render` | request text and interpretation; captions; blob refs | demo provenance, from request to file |
+| `Site` | The graph's own record. There is one per device graph. | `domain`, `device`, `schema_version`, `algo_version`, `embed_model`, `embed_dim`. A graph built with one embedding model refuses another. |
+| `Page` | A URL template: every URL that differs only in ids or query values. | `url_template`, `title`, `example_urls` (≤5), `example_titles` (≤8) |
+| `State` | One screen: a page with a particular set of persistent component states, for example the cart with the login dialog open. Routes run from State to State. | `summary`, `emb` (384-d), `aliases`, `tokens`, `untried_count`, `pagerank`, `betweenness`, `harmonic`, `community`, `reachable`, `demo_score`, `phash`, `screenshot_ref`. Labels: `:Entry`, `:Frontier`, `:Blocking`, `:DeadEnd` (see below). |
+| `Component` | A region with an ARIA landmark or widget role (navigation, form, dialog, menu, list, …), or the page body. | `kind`, `blocking` (modal dialog), `ephemeral` |
+| `ComponentState` | One version of a component's contents, for example a menu `absent` or `open`. | `name`, `skeleton_hash`, `aria_state`, `screenshot_ref` (a crop of the region) |
+| `Element` | An interactive control: link, button, field, select, checkbox, … | `role`, `name_sample`, `locators` (role+name, test id, CSS, text; ordered by `locator_hits`), `fingerprint` (role, name, tag, attributes, CSS path, box), `risk`, `risk_cost`, `tried`, `heal_count`, `is_template`, `count`, `sample_items` |
+| `Intent` | A user goal in plain words, such as "view shopping cart". It is written when a screen is summarised or a workflow is saved. | `text`, `emb`, `hits` |
+| `Feature` | An area of the site: a community of States found by label propagation, with a short name. | `name`, `size`, `medoid_gid`, `emb` |
+| `Workflow`, `WStep` | A saved automation and its ordered steps. A step names an `ACTION` and, for typed input, only a variable name. | `name`, `run_count`, `success_rate`, `demo_score`, `pagerank`; `order`, `action_gid`, `value_var` |
+| `Run`, `Step`, `Observation` | The activity log. A run is one exploration, automation or demo. A step is one action attempt. An observation is evidence about a step (`heal`, `unexpected_state`, `recovery`, `item_choice`, `curation`, `visual_diff`). The last 100 runs are kept in full. | `kind`, `status`; `ok`, `healed`, `latency_ms`, `screenshot_ref` (failures only); `detail`, `before_ref`, `after_ref` |
+| `DemoRequest`, `Storyboard`, `Shot`, `Render` | A demo from request to file. Each shot points to the screen it shows and the step that produced it. | request text, captions, `map_commit`, blob references |
 
-### Device graph edges
+State labels exist because FalkorDB's algorithms filter by label, not by property:
+- `:Entry` is the start page.
+- `:Frontier` has elements within the risk limit that were never tried.
+- `:Blocking` has a modal dialog open.
+- `:DeadEnd` has no outgoing `ACTION`.
 
-| Edge | From -> To | Used by |
-|---|---|---|
-| **`ACTION`** | State -> State | routing (`algo.SPpaths`), next-action, frontier BFS, PageRank / betweenness / label propagation. Properties: `action_type`, `el_gid`, `pre_cstates`, `requires_inputs`, `risk_cost`, `seen_count`, `success_count`, `reliability`, `cost` |
-| **`TRANSITION`** | ComponentState -> ComponentState | menus/dialogs opening (by click **or hover**); satisfies `pre_cstates` |
-| `HAS_STATE`, `COMPOSED_OF`, `HAS_CSTATE`, `CONTAINS` | containment | ownership (`HAS_*`), shared membership (`COMPOSED_OF`), visibility (`CONTAINS`) |
-| `FULFILLED_BY` | Intent -> State / Workflow | request-to-goal lookup |
-| `STEP_OF`, `FROM`, `ON` | WStep -> ... | workflows, impact analysis, demo scoring |
-| `IN_RUN`, `NEXT`, `FROM` / `TO`, `EXECUTED`, `DURING`, `OF` | activity | workflow mining, retention, drift and heal evidence |
-| `PRODUCED`, `BASED_ON`, `IN_STORYBOARD`, `SHOWS`, `FROM_STEP`, `RENDERED_AS` | demo layer | provenance, re-rendering |
+#### Relationships
 
-### Ops and profile graphs
+| Type | From → To | Meaning | Properties |
+|---|---|---|---|
+| `ACTION` | State → State | Using element `el_gid` on the source screen leads to the target screen. | `action_type` (click, hover, select, check, press), `el_gid`, `label`, `risk`, `risk_cost`, `seen_count`, `success_count`, `reliability`, `cost`, `pre_cstates` (menus that must be open first), `pre_actions` (steps learned from earlier recoveries, such as closing a banner), `requires_inputs` (fields filled before the action) and `value_var` (the *name* of the typed value, never the value), `first_seen`, `last_seen` |
+| `TRANSITION` | ComponentState → ComponentState | An element changes one region without changing the screen, for example a hover that opens a menu. | `el_gid`, `action_type`, `reliability` |
+| `BROKEN_ACTION`, `BROKEN_TRANSITION` | as above | A quarantined edge. It keeps all its properties, but it has a different type, so routing and algorithms no longer see it. | `reason`, `broken_since`, `superseded_by` |
+| `HAS_STATE` | Page → State | The screens of a page. | |
+| `HAS_CSTATE` | Component → ComponentState | The versions of a region. | |
+| `COMPOSED_OF` | State → ComponentState | Which region versions make up a screen. | |
+| `CONTAINS` | ComponentState → Element | The controls visible in that version. | |
+| `FULFILLED_BY` | Intent → State / Workflow | This screen or workflow satisfies the goal. | `score` |
+| `STEP_OF`, `ON`, `FROM` | WStep → Workflow / Element / State | A workflow step: its workflow, element and starting screen. | |
+| `CALLS` | WStep → Workflow | A step that runs another workflow (composition, up to 3 levels deep). | |
+| `FOLLOWED_BY` | Workflow → Workflow | The second workflow was run within 30 minutes after the first. | `count` |
+| `SIMILAR_TO` | Workflow → Workflow | Similar purpose (embedding similarity ≥ 0.8). | `score` |
+| `IN_RUN`, `NEXT`, `FROM`, `TO`, `EXECUTED` | Step → Run / Step / State; Run → Workflow | The order of the attempts, where each started and where it really landed. | |
+| `DURING`, `OF` | Observation → Step / Element | What an observation is about. | |
+| `PRODUCED`, `BASED_ON`, `IN_STORYBOARD`, `SHOWS`, `FROM_STEP`, `RENDERED_AS` | demo nodes | Demo provenance. | |
 
-| Graph | Label | Holds |
-|---|---|---|
-| ops | `Agent`, `Task`, `Claim` | registry, work queue per request, leases (`HELD_BY`) |
-| ops | `WorkItem` | shared exploration to-do list: `kind` page / click / hover, `url`, `el_gid`, `pre` (the clicks/hovers that lead there), `status` |
-| profile | `Preference`, `ExplorationPolicy` | user settings; the default policy that bounds exploration (max risk, depth, budget, deny patterns) |
-| profile | `Session`, `Request`, `Memory`, `SiteEntry` | conversation history, searchable memory, index of the user's sites |
+How an `ACTION` is scored:
+- **Reliability:** `reliability = (success_count + 1) / (seen_count + 2)`. A new edge starts at 0.5 and moves with evidence.
+- **Cost:** `cost = 1 + 2 · (−ln reliability)`, so a flaky edge is expensive.
+- **Risk:** `risk_cost` comes from the element's risk class: 0 read / navigate / input, 1 safe submit, 100 changes data (buy, post, sign up), 1000 leaves the site, 10000 destructive (delete, cancel).
 
-## Cypher queries and algorithms the product depends on
+#### The other graphs, in short
 
-All queries are in the code; the main ones:
+- **Ops**:
+  - **Coordination:** `Agent`, `Task` (`SUBTASK_OF`, `DEPENDS_ON`), `Claim`, a lease `HELD_BY` an agent, and `WorkItem`, the shared exploration queue. A work item is one page to scan or one click / hover path to try.
+  - **History:** `Branch`, `Commit` (`PARENT`, `AUTHORED_BY`), `Change` (`HAS_CHANGE`) and `Tag`. Every change to a device graph is a recorded operation that can be replayed into a merge or reverted.
+- **Profile:** `Preference`, `ExplorationPolicy` (risk limit, depth, budget, denied patterns, per site), `Memory`, `Session` and `Request`, `SiteEntry`, `VaultRef`.
+- **Semantic:**
+  - `UIPattern`: a kind of region seen on several sites.
+  - `LogicalState`: the same screen on different devices.
+  - `StepPattern` and `FlowPattern`.
+  
+  They are linked to the device graphs through `SiteRef`, `ComponentRef`, `DeviceStateRef` and `WorkflowRef`. The `DEVICE_DELTA` edge records how many extra steps a screen takes on a phone.
+
+### How the agent queries the graph
+
+Each question the agent asks is one query. Simplified versions follow; the full code is in `src/sitegraph/graph/queries.py` unless noted.
+
+**Which screen does the user mean?** `find_targets`, three steps:
+1. A list item named in the request ("Travel") leads to the shared screen behind that list.
+2. A vector search over intents.
+3. A vector search over screen and workflow summaries.
 
 ```cypher
-// Intent resolution - graph/queries.py find_targets
-CALL db.idx.vector.queryNodes('Intent', 'emb', $k, vecf32($v)) YIELD node
-MATCH (node)-[f:FULFILLED_BY]->(t)
-RETURN labels(t)[0], t.gid, coalesce(t.summary, t.name, node.text), node.emb, coalesce(f.score, 1.0)
-
-// Risk-capped route - best_routes (an automation script and its own explanation)
-MATCH (s:State {gid:$src}), (t:State {gid:$dst})
-CALL algo.SPpaths({sourceNode: s, targetNode: t, relTypes: ['ACTION'], weightProp: 'cost',
-                   costProp: 'risk_cost', maxCost: $max_cost, maxLen: $max_len, pathCount: $k})
-YIELD path, pathWeight, pathCost  ...
-
-// Next actions
-MATCH (s:State {gid:$g})-[a:ACTION]->(t:State) WHERE a.risk_cost <= $mrc
-RETURN a.gid, a.label, t.gid, a.seen_count * a.reliability AS score ORDER BY score DESC LIMIT $k
-
-// Exploration frontier
-MATCH (e:State:Entry) CALL algo.bfs(e, $depth, 'ACTION') YIELD nodes
-UNWIND nodes + [e] AS n WITH DISTINCT n WHERE n:Frontier
-RETURN n.gid, n.summary, n.untried_count ORDER BY n.untried_count DESC LIMIT $limit
-
-// Workflow mining (consecutive successful steps, then greedy extension in code)
-MATCH (a:Step)-[:NEXT]->(b:Step) WHERE a.ok AND b.ok AND a.action_gid <> b.action_gid
-RETURN a.action_gid, b.action_gid, count(*) AS freq ORDER BY freq DESC
-
-// Impact analysis (what breaks if this component changes?)
-MATCH (c:Component {gid:$c})-[:HAS_CSTATE]->(:ComponentState)-[:CONTAINS]->(e:Element)
-MATCH (ws:WStep)-[:ON]->(e), (ws)-[:STEP_OF]->(w:Workflow)
-OPTIONAL MATCH (sb:Storyboard)-[:BASED_ON]->(w)  RETURN ...
-
-// Curator - agents/curator.py
-CALL algo.pageRank('State', 'ACTION') YIELD node, score SET node.pagerank = score
-CALL algo.betweenness({nodeLabels:['State'], relationshipTypes:['ACTION'], samplingSize:64, samplingSeed:42}) ...
-CALL algo.labelPropagation({nodeLabels:['State'], relationshipTypes:['ACTION'], maxIterations:20}) ...
-
-// Atomic claim - ops.py Ops.claim (writes are serialised per graph; the lease expires)
-MATCH (a:Agent {id:$a}) OPTIONAL MATCH (c:Claim {target_gid:$g})
-WITH a, c WHERE c IS NULL
-CREATE (:Claim {target_gid:$g, graph:$graph, expires_at:$exp})-[:HELD_BY]->(a)  RETURN true
-
-// Edge upsert with reliability and cost - graph/map_writer.py
-MERGE (a)-[r:ACTION {gid:$g}]->(b)
-SET r.seen_count = coalesce(r.seen_count, 0) + 1, r.success_count = coalesce(r.success_count, 0) + $succ
-WITH r SET r.reliability = toFloat(r.success_count + 1) / (r.seen_count + 2)
-WITH r SET r.cost = 1.0 + $lam * (0.0 - log(r.reliability))
+CALL db.idx.vector.queryNodes('Intent', 'emb', $k, vecf32($request_vector)) YIELD node
+MATCH (node)-[f:FULFILLED_BY]->(target)
+RETURN labels(target)[0], target.gid, coalesce(target.summary, target.name), f.score
 ```
 
-FalkorDB detail worth knowing: inside one query a later `SET` does **not** see an earlier `SET` on the same entity, so derived values use `WITH` barriers (as above).
+**How do I get there safely?** `best_routes`. This is the cheapest path over `ACTION` edges whose total `risk_cost` stays under the policy's limit. The path *is* the automation script, and its steps are the explanation shown to the user.
 
-## How the graph shapes the agent
+```cypher
+MATCH (s:State {gid:$from}), (t:State {gid:$to})
+CALL algo.SPpaths({sourceNode: s, targetNode: t, relTypes: ['ACTION'],
+                   weightProp: 'cost', costProp: 'risk_cost', maxCost: $max_risk, pathCount: 3})
+YIELD path, pathWeight
+RETURN path ORDER BY pathWeight
+```
 
-- **Route = plan.** A shortest path over `ACTION` edges is literally the automation script, and the path is its explanation (reliability and last-seen per step).
-- **Reliability-weighted costs.** `reliability = (successes+1)/(seen+2)` and `cost = 1 + 2*(-ln reliability)`, so flaky edges are avoided and the success probability of a route is the product of its steps.
-- **Risk cap via `costProp` / `maxCost`.** Each action has a `risk_cost` (0 read/navigate/input, 1 safe submit, 100 mutating, 1000 external, 10000 destructive). The planner and explorer cap it, so "checkout" is never taken unless a policy allows it; a goal reachable only through a risky step returns `no_route`.
-- **Healing writes back to the graph.** When a stored locator fails, the resolver tries other locators, a fingerprint match, an embedding match and an LLM; the winner is promoted into `Element.locators` and recorded as an `Observation{kind:'heal'}`.
-- **Demos are subgraphs.** A storyboard is a route (or a saved workflow, a single interaction, or a feature area) with each `Shot` linked to the exact edge and `Step` it shows.
-- **Agents coordinate through the graph.** Exploration work is stored as `WorkItem`s in the ops graph. Page scans and click/hover paths are claimed with expiring leases, so several Navigators on one site never repeat each other's work, and a crashed agent's work is picked up again.
+**What can I do from here?** `next_actions` lists moves from the current screen, ordered by how often they were seen and how reliable they are.
+
+```cypher
+MATCH (s:State {gid:$here})-[a:ACTION]->(t:State) WHERE a.risk_cost <= $max_risk
+RETURN a.label, t.summary, a.seen_count * a.reliability AS score ORDER BY score DESC LIMIT 5
+```
+
+**What is still unexplored?** `frontier_states` returns screens reachable from the entry that still have untried elements, the most central first.
+
+```cypher
+MATCH (e:State:Entry) CALL algo.bfs(e, 8, 'ACTION') YIELD nodes
+UNWIND nodes + [e] AS n WITH DISTINCT n WHERE n:Frontier
+RETURN n.gid, n.untried_count, n.harmonic ORDER BY n.untried_count DESC, n.harmonic DESC
+```
+
+Explorers do not read this list directly. They take `WorkItem`s from the ops graph, highest priority first, and claim each with an expiring lease, so two explorers never do the same work (`ops.py`).
+
+**The stored element is gone. What else could it be?** `fulltext_elements` is the cheapest healing fallback before fingerprint, embedding and model matching. It finds other known elements with a matching name, and never a riskier one than the original.
+
+```cypher
+CALL db.idx.fulltext.queryNodes('Element', $name_words) YIELD node
+WHERE node.role = $role AND node.risk_cost <= $original_risk_cost
+RETURN node.gid
+```
+
+**What breaks if this region changes?** `impact_of_component` lists the workflows and demos that use the region's elements.
+
+```cypher
+MATCH (c:Component {gid:$region})-[:HAS_CSTATE]->(:ComponentState)-[:CONTAINS]->(e:Element)
+MATCH (ws:WStep)-[:ON]->(e), (ws)-[:STEP_OF]->(w:Workflow)
+OPTIONAL MATCH (sb:Storyboard)-[:BASED_ON]->(w)
+RETURN e.name_sample, collect(DISTINCT w.name), collect(DISTINCT sb.title)
+```
+
+**Who discovered this, and when?** `GitOps.blame` in `git.py` runs on the ops graph. It feeds the "discovered by explorer-desktop-0 in c:1ba9…" line in route explanations.
+
+```cypher
+MATCH (c:Commit)-[h:HAS_CHANGE]->(x:Change) WHERE x.touched CONTAINS $gid
+OPTIONAL MATCH (c)-[:AUTHORED_BY]->(a:Agent)
+RETURN c.id, c.msg, a.id, x.op ORDER BY c.ts
+```
+
+**Precomputed by the Curator** (`agents/curator.py`) after every exploration. The scores are stored on nodes, so the queries above only read a property:
+
+```cypher
+CALL algo.pageRank('State', 'ACTION') YIELD node, score SET node.pagerank = score
+CALL algo.betweenness({nodeLabels:['State'], relationshipTypes:['ACTION']}) YIELD node, score SET node.betweenness = score
+CALL algo.HarmonicCentrality({nodeLabels:['State'], relationshipTypes:['ACTION']}) YIELD node, score SET node.harmonic = score
+CALL algo.labelPropagation({nodeLabels:['State'], relationshipTypes:['ACTION']}) YIELD node, communityId SET node.community = communityId
+CALL algo.WCC({nodeLabels:['State'], relationshipTypes:['ACTION']})  // which screens the entry can reach
+MATCH (s:State) WHERE NOT (s)-[:ACTION]->() SET s:DeadEnd
+```
+
+| Score | What it is used for |
+|---|---|
+| PageRank, betweenness | Which screens are worth a demo (`demo_score`) |
+| Harmonic centrality | Which unexplored screen to try first |
+| Communities | The site's `Feature` areas |
+| Reachability | Screens that no longer connect to the entry |
+
+**Writing an observed move** (`graph/map_writer.py`). Each attempt updates the counters, then the reliability and cost:
+
+```cypher
+MERGE (a)-[r:ACTION {gid:$g}]->(b)
+SET r.seen_count = coalesce(r.seen_count, 0) + 1, r.success_count = coalesce(r.success_count, 0) + $ok
+WITH r SET r.reliability = toFloat(r.success_count + 1) / (r.seen_count + 2)
+WITH r SET r.cost = 1.0 + $lambda * (0.0 - log(r.reliability))
+```
+
+The `WITH r` barriers are needed: in FalkorDB, a `SET` does not see a value written by an earlier `SET` on the same entity in the same clause.
 
 ## Agents and tools
 
