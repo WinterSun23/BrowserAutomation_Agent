@@ -64,3 +64,41 @@ def test_director_produces_renders(world, interp):
     assert rows and all(r[0] == "ok" for r in rows)
     assert store.ro_query(key, "MATCH (:Storyboard {gid:$g})<-[:IN_STORYBOARD]-(:Shot)-[:FROM_STEP]->(:Step) "
                                "RETURN count(*) > 0", {"g": res.storyboard_gid}) == [[True]]
+
+
+@pytest.mark.integration
+@pytest.mark.browser
+@pytest.mark.slow
+def test_make_demo_over_mcp_after_a_browser_tool(world):
+    """Every MCP call runs on one worker thread; the browser tools have already started Playwright there, so the
+    demo recorder must not start a second one (it used to fail with 'Playwright Sync API inside the asyncio loop')."""
+    import asyncio
+
+    from mcp import Client
+
+    from sitegraph.mcp_server import build_server
+    from sitegraph.tools import ToolContext, build_toolbox
+
+    store, settings, key, domain, blobs = world
+    interp = {"formats": ["screenshot"], "scope_kind": "goal", "target": "open cart"}
+    ctx = ToolContext(settings=settings, store=store, key=key, domain=domain, embedder=HashEmbedder(),
+                      llm=FakeLLM(_responder(interp)), blobs=blobs)
+    box = build_toolbox(ctx)
+    site = store.ro_query(key, "MATCH (p:Page) RETURN p.example_urls[0] LIMIT 1")[0][0]
+
+    server = build_server(box)
+
+    async def go():
+        async with Client(server) as client:
+            opened = await client.call_tool("open_url", {"url": site})
+            demo = await client.call_tool("make_demo", {"request": "make a demo"})
+            return opened, demo
+
+    try:
+        opened, demo = asyncio.run(go())
+    finally:
+        server.close_tools()
+    assert not opened.is_error
+    text = "\n".join(getattr(c, "text", "") for c in demo.content)
+    assert not demo.is_error, text
+    assert '"format": "screenshot"' in text
