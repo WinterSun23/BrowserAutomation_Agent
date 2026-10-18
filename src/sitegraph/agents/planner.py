@@ -1,6 +1,8 @@
 """Request planning (split a request into steps of the existing kinds) and the choice between close targets."""
 from __future__ import annotations
 
+import re
+
 import json
 import logging
 from dataclasses import dataclass, field
@@ -32,6 +34,23 @@ def _kinds() -> list[str]:
     from .orchestrator import KINDS   # imported late: the orchestrator may import this module
 
     return KINDS + ["chat"]           # chat: a message that needs nothing done on the site (handled by the chat agent)
+
+
+_EXPLORE_WORDS = re.compile(r"\b(explore|crawl|map|discover|learn the site)\b", re.I)
+
+
+def _tidy_steps(steps: list[PlanStep], text: str) -> list[PlanStep]:
+    """Exploring a site is slow and costly, so an explore step stays only when the request asks for it (a small model
+    labels plain questions "explore"), and repeated explore steps are one."""
+    asked = bool(_EXPLORE_WORDS.search(text))
+    out, seen_explore = [], False
+    for s in steps:
+        if s.kind == "explore":
+            if not asked or seen_explore:
+                continue
+            seen_explore = True
+        out.append(s)
+    return out
 
 
 def _keyword_step(text: str) -> PlanStep:
@@ -110,6 +129,7 @@ class Planner:
             item = r.get("item")
             steps.append(PlanStep(r["kind"], str(r.get("goal") or text), _map_params(params, inputs or []),
                                   str(item) if item not in (None, "") else None))
+        steps = _tidy_steps(steps, text)
         whole = next((s for s in steps if s.kind in WHOLE_REQUEST_KINDS), None)
         if whole is not None:
             steps = [whole]

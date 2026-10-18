@@ -59,3 +59,6 @@ anomaly_edge_reliability: 0.4
 # policy:
 #   max_depth: 6
 #   budget_s: 600
+policy:
+  max_depth: 6
+  budget_s: 600

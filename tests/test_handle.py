@@ -148,3 +148,27 @@ def test_a_forced_kind_is_a_one_step_plan(shop):
     o, site = _orch(shop, _llm(CART))
     rr = o.handle("I like gifs", site, kind="remember")
     assert rr.plan.source == "override" and rr.steps[0]["kind"] == "remember" and rr.status == "done"
+
+
+def test_a_question_the_plan_did_not_answer_goes_on_to_the_tool_loop(shop):
+    # the plan only explored; "find the cheapest ..." still needs an answer, so the model finishes it
+    o, site = _orch(shop, _llm([{"kind": "explore", "goal": "site"}]))
+    seen = []
+    loop_llm = ScriptedLLM([lambda m, t: seen.append(m[-1].content) or ChatMessage("assistant", content="the cheapest is X")])
+    agent = ExecutionAgent(o.s, o.store, o.embedder, o.llm, None, site, o.profile, chat_llm=loop_llm, orchestrator=o)
+    try:
+        run = agent.ask("explore and find the cheapest product")
+        assert run.answer == "the cheapest is X" and len(loop_llm.calls) == 1
+        assert "Explored" in seen[0] and "finish the request" in seen[0].lower()
+    finally:
+        agent.close()
+
+
+def test_a_finished_action_with_no_question_needs_no_tool_loop(shop):
+    o, site = _orch(shop, _llm(CART))
+    loop_llm = ScriptedLLM([])
+    agent = ExecutionAgent(o.s, o.store, o.embedder, o.llm, None, site, o.profile, chat_llm=loop_llm, orchestrator=o)
+    try:
+        assert agent.ask("take me to my cart").status == "done" and not loop_llm.calls
+    finally:
+        agent.close()
