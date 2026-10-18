@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 import yaml
@@ -27,6 +27,7 @@ class Settings:
     min_target_score: float = 0.35
     sample_input_text: str = "test"
     headless: bool = True
+    policy: dict = field(default_factory=dict)  # per-run overrides of the exploration policy (see ExplorationPolicy)
     visual_diff_bits: int = 6          # dHash bits that must differ before a same-state click counts as a visual change
     use_git: bool = True
     checkpoint_every: int = 20
@@ -44,9 +45,19 @@ class Settings:
     claim_ttl_ms: int = 120000
     claim_wait_s: float = 5.0
     claim_retries: int = 3
+    goal_explore: bool = True          # a request for a screen the map lacks explores toward it first
+    goal_explore_round_states: int = 12  # new screens per exploration round while searching for the goal
+    goal_explore_max_rounds: int = 8   # rounds before giving up (the policy's state and time budgets also apply)
+    dynamic_spawn: bool = True         # start explorers as work piles up (False: start all navigators at once)
+    spawn_min_backlog: int = 4         # unclaimed open work items that must be waiting ...
+    spawn_after_s: float = 3.0         # ... for this long before one more explorer is started
+    spawn_poll_s: float = 0.5          # how often the backlog is checked
     max_scrolls: int = 8
     agent_max_steps: int = 60          # model turns per request (each may call tools)
     agent_max_tokens: int = 400000     # token budget per request
+    agent_repeat_limit: int = 5        # the same tool call with the same result this many times stops the request (0: off)
+    agent_keep_observations: int = 2   # page observations re-sent in full to the model (older ones become a stub; 0: all)
+    chat_learn: bool = True            # curate the pages the chat agent visited by hand when a request ends
     escalate_navigator: bool = True    # a stuck Navigator step may hand over to an LLM recovery agent (needs a chat LLM)
     max_escalations_per_run: int = 5   # recovery attempts allowed per execution run
     escalation_max_steps: int = 30     # model turns one recovery attempt may use

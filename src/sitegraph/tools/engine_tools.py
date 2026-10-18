@@ -104,6 +104,18 @@ def _explore(ctx: ToolContext, args: dict):
             "blocked_as_risky": rep.blocked, "navigators": n, "agents": agents, **stats}
 
 
+def _explore_toward(ctx: ToolContext, args: dict):
+    """Explore only as far as needed to find a screen for the goal (rounds of a few screens, most promising first)."""
+    entry = (entry_state(ctx.store, ctx.key) or [None, None])[1] or args.get("entry_url")
+    if not entry:
+        raise ValueError("the site has not been explored and no entry_url was given")
+    cap = max(1, min(MAX_NAVIGATORS, ctx.settings.navigators_per_site))
+    orch = Orchestrator(ctx.settings, ctx.store, ctx.embedder, ctx.llm, ctx.blobs, NullEvents())
+    site = SiteInfo(ctx.domain, ctx.device, ctx.key, ops_key(ctx.settings.uid, ctx.domain), entry)
+    out = orch.explore_toward(site, args["goal"], args["goal"], policy_of(ctx), "chat-explore", cap)
+    return out or {"found": True, "rounds": 0, "states_added": 0, "reason": "the map already has a matching screen"}
+
+
 def _run_on_devices(ctx: ToolContext, args: dict):
     """The same request on several devices at once (phone / tablet / desktop), tracked as one parent task."""
     devices = list(dict.fromkeys(args["devices"]))
@@ -197,6 +209,12 @@ def register(box: Toolbox) -> None:
         {"type": "object", "properties": {"entry_url": {"type": "string"}, "navigators": {"type": "integer",
                                                                                          "minimum": 1}}},
         _explore, "act"))
+    box.register(ToolSpec(
+        "explore_toward", "Explore the site only as far as needed to find a screen for a goal the saved map does not "
+        "have yet (most promising links first, in small rounds, within the exploration budget). Then use run_goal. "
+        "Prefer this over exploring the whole site.",
+        {"type": "object", "properties": {"goal": {"type": "string"}, "entry_url": {"type": "string"}},
+         "required": ["goal"]}, _explore_toward, "act"))
     box.register(ToolSpec(
         "run_on_devices", "Run one request (for example 'explore the site') on several devices at once, each with its "
         "own map: desktop, tablet, phone. The browsers allowed by the configuration are split between the devices.",

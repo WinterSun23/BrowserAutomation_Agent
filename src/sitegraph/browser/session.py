@@ -24,13 +24,28 @@ _SCROLL_JS = """async () => {
   await new Promise(r => setTimeout(r, 250));
   return de.scrollHeight > h0;
 }"""
+_LISTENERS_JS = """(() => {
+  const types = new Set(['click', 'dblclick', 'mousedown', 'mouseup', 'pointerdown', 'pointerup', 'touchstart',
+                         'mouseover', 'mouseenter']);
+  const found = new WeakSet();
+  for (const el of document.querySelectorAll('*')) {
+    let ls; try { ls = getEventListeners(el); } catch (e) { continue; }
+    for (const t in ls) { if (types.has(t) && ls[t].length) { found.add(el); break; } }
+  }
+  window.__sgClickable = found;
+  return true;
+})()"""
 _DEVICES = {"phone": "iPhone 13", "tablet": "iPad Pro 11"}
 
 
 class BrowserSession:
     def __init__(self, device: str = "desktop", headless: bool = True,
-                 record_video_dir: Path | None = None, video_size: tuple[int, int] = (1280, 720)):
+                 record_video_dir: Path | None = None, video_size: tuple[int, int] = (1280, 720),
+                 detect_listeners: bool | None = None):
         self.device, self.headless = device, headless
+        # find role-less clickables through the page's own event listeners (Chromium only; SITEGRAPH_NO_LISTENERS=1 turns it off)
+        self.detect_listeners = (not os.environ.get("SITEGRAPH_NO_LISTENERS")) if detect_listeners is None else detect_listeners
+        self._cdp, self._cdp_page = None, None
         self.record_video_dir, self.video_size = record_video_dir, video_size
         self.video_path: Path | None = None
 
@@ -87,7 +102,22 @@ class BrowserSession:
             pass  # page navigated mid-scroll; the next snapshot re-reads the DOM
         return grown
 
+    def _mark_listeners(self) -> None:
+        """Remember (in the page, in a WeakSet) every element with a click / pointer / hover listener, using the
+        DevTools command-line API `getEventListeners`, which plain page scripts cannot call. One CDP call, no cap on
+        the number of elements. Any failure (another browser engine, a page that navigated meanwhile) just means
+        the cheap hints alone are used."""
+        try:
+            if self._cdp is None or self._cdp_page is not self.page:
+                self._cdp, self._cdp_page = self.context.new_cdp_session(self.page), self.page
+            self._cdp.send("Runtime.evaluate", {"expression": _LISTENERS_JS, "includeCommandLineAPI": True,
+                                                "returnByValue": True})
+        except Exception:
+            self._cdp = None
+
     def snapshot(self) -> RawSnapshot:
+        if self.detect_listeners:
+            self._mark_listeners()
         return RawSnapshot.from_dict(self.page.evaluate(EXTRACT_JS))
 
     def screenshot_png(self) -> bytes:

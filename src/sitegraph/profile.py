@@ -23,6 +23,7 @@ class Profile:
         self.key = profile_key(uid)
         ensure_profile_schema(store, self.key, dim)
         self.vault = Vault(uid)
+        self.policy_overrides: dict = {}   # config.yaml `policy:` block and command-line flags; never written to the graph
 
     def q(self, cypher: str, **params):
         return self.store.query(self.key, cypher, params)
@@ -35,6 +36,9 @@ class Profile:
         return {k: json.loads(v) for k, v in self.q("MATCH (p:Preference) RETURN p.key, p.value")}
 
     def default_policy(self) -> ExplorationPolicy:
+        return self._stored_default_policy().with_overrides(self.policy_overrides)
+
+    def _stored_default_policy(self) -> ExplorationPolicy:
         rows = self.q("MATCH (p:ExplorationPolicy {is_default:true}) RETURN p.data LIMIT 1")
         if rows:
             return ExplorationPolicy.from_dict(json.loads(rows[0][0]))
@@ -57,7 +61,8 @@ class Profile:
     def policy_for(self, domain: str, device: str = "desktop") -> ExplorationPolicy:
         rows = self.q("MATCH (p:ExplorationPolicy)-[:APPLIES_TO]->(:SiteEntry {gid:$g}) RETURN p.data LIMIT 1",
                       g=gid("site", domain, device))
-        return ExplorationPolicy.from_dict(json.loads(rows[0][0])) if rows else self.default_policy()
+        stored = ExplorationPolicy.from_dict(json.loads(rows[0][0])) if rows else self._stored_default_policy()
+        return stored.with_overrides(self.policy_overrides)
 
     def start_session(self) -> str:
         sid = ulid("ses")

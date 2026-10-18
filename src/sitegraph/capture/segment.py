@@ -182,7 +182,7 @@ def build_state(raw: RawSnapshot, domain: str, template_min: int = 4) -> StateOb
                           else _INPUT_KIND.get(n.role),
                           href_template=url_template(n.href) if n.href else None,
                           in_form=comp_gids.get(form_idx) if form_idx is not None else None,
-                          hoverable=_hoverable(n))
+                          hoverable=_hoverable(n), inferred=n.inferred)
             if n.idx in tpl_rep:
                 t, j = tpl_rep[n.idx]
                 pos = t.positions[j]

@@ -88,9 +88,52 @@
       ':scope > [class*="submenu"], :scope > [class*="sub-menu"]');
     return !!sub && sub !== el && !visible(sub);
   };
+  // Elements with no ARIA / implicit role that are clickable anyway (a <div onclick>, a framework-rendered button)
+  // are taken to be buttons. Signals: an event listener found through the DevTools API (window.__sgClickable, filled
+  // by the browser session) or a cheap hint (onclick, tabindex, a btn / button class, a pointer cursor that starts here).
+  const NOT_CLICKABLE = new Set(['html', 'body', 'head', 'script', 'style', 'noscript', 'svg', 'path', 'br', 'hr']);
+  const listened = window.__sgClickable;
+  const hint = (el) => {
+    if (listened && listened.has(el)) return true;
+    if (el.hasAttribute('onclick') || el.hasAttribute('onmousedown') || el.hasAttribute('onmouseup')) return true;
+    const ti = el.getAttribute('tabindex'); if (ti !== null && ti !== '-1') return true;
+    if (typeof el.className === 'string' && /(^|[\s_-])(btn|button)([\s_-]|$)/i.test(el.className)) return true;
+    if (getComputedStyle(el).cursor === 'pointer') {
+      const p = el.parentElement; return !p || getComputedStyle(p).cursor !== 'pointer';
+    }
+    return false;
+  };
+  const everything = document.body ? [...document.body.querySelectorAll('*')] : [];
+  const inferred = new Map();
+  for (const el of everything) {
+    if (role(el) || NOT_CLICKABLE.has(el.tagName.toLowerCase()) || el instanceof SVGElement) continue;
+    if (!hint(el) || !visible(el)) continue;
+    inferred.set(el, null);
+  }
+  if (inferred.size) {
+    // a wrapper that holds a real control (or another candidate) is not itself the control; nor is a page-sized box
+    const holdsControl = new Set();
+    const markAncestors = (el) => {
+      let p = el.parentElement;
+      while (p && !holdsControl.has(p)) { holdsControl.add(p); p = p.parentElement; }
+    };
+    for (const el of everything) {
+      const r = role(el);
+      if ((r && INTERACTIVE.has(r) && visible(el)) || inferred.has(el)) markAncestors(el);
+    }
+    const area = Math.max(1, innerWidth * innerHeight);
+    for (const el of [...inferred.keys()]) {
+      const rc = el.getBoundingClientRect();
+      const nm = (text(el).slice(0, 300) || el.getAttribute('aria-label') || el.getAttribute('title') ||
+                  el.getAttribute('data-testid') || '').trim();
+      if (holdsControl.has(el) || rc.width * rc.height > 0.6 * area || !nm) inferred.delete(el);
+      else inferred.set(el, nm);
+    }
+  }
   const nodes = []; const index = new Map();
-  for (const el of (document.body ? document.body.querySelectorAll('*') : [])) {
-    const r = role(el); if (!r) continue;
+  for (const el of everything) {
+    const wasInferred = inferred.has(el);
+    const r = wasInferred ? 'button' : role(el); if (!r) continue;
     const interactive = INTERACTIVE.has(r);
     if (!interactive && !STRUCTURAL.has(r)) continue;
     if (!visible(el)) continue;
@@ -98,7 +141,7 @@
     while (p) { if (index.has(p)) { parent = index.get(p); depth = nodes[parent].depth + 1; break; } p = p.parentElement; }
     const rect = el.getBoundingClientRect();
     const node = {
-      idx: nodes.length, role: r, name: accName(el), tag: el.tagName.toLowerCase(),
+      idx: nodes.length, role: r, name: wasInferred ? inferred.get(el) : accName(el), inferred: wasInferred, tag: el.tagName.toLowerCase(),
       href: el.getAttribute('href') ? el.href : null, input_type: el.getAttribute('type'),
       parent, depth, interactive,
       states: {

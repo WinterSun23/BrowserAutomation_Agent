@@ -21,6 +21,7 @@ class RawNode:
     gcss: str
     testid: str | None
     attrs: dict
+    inferred: bool = False   # no ARIA / implicit role: taken to be a button because it has a click hint or listener
 
 
 @dataclass
@@ -58,6 +59,7 @@ class ElementObs:
     input_kind: str | None = None
     href_template: str | None = None
     in_form: str | None = None
+    inferred: bool = False   # a role-less element captured as a button (see extract.js)
     hoverable: bool = False  # likely to reveal a hidden menu on hover (aria-haspopup or a hidden sibling menu)
 
     def props(self) -> dict:

@@ -6,7 +6,11 @@ import re
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from ..browser.items import choose_item, live_item_texts
+from ..db import device_key, ops_key
 from ..graph.queries import entry_state
+from ..graph.map_writer import MapWriter
+from ..ops import Ops
+from ..schema import ensure_device_schema
 from ..normalize import domain_of, var_name
 from ..policy import robots_allowed
 from .core import ToolContext, ToolSpec, Toolbox
@@ -16,7 +20,37 @@ MAX_ELEMENTS = 150
 
 
 def get_nav(ctx: ToolContext):
-    """The context's Navigator (its resolver, writer and settle helpers), on the context's single browser."""
+    """The Navigator for the site the browser is on now (its resolver, writer and settle helpers), on the context's
+    single browser. Pages of another site than the session's get a Navigator of their own, so they are judged
+    against their own domain (its links are not 'external') and recorded in that site's own graph."""
+    home = _home_nav(ctx)
+    page = ctx.session.page.url if ctx.session is not None else ""
+    domain = domain_of(page) if page.startswith("http") else ""
+    if not domain or domain == ctx.domain:
+        return home
+    navs = ctx.extra.setdefault("domain_navs", {})
+    if domain not in navs:
+        navs[domain] = _site_nav(ctx, domain, page)
+    return navs[domain]
+
+
+def _site_nav(ctx: ToolContext, domain: str, url: str):
+    """A Navigator on `domain`'s own graph (created and registered the first time the agent visits that site)."""
+    from ..agents.factory import make_navigator
+
+    s, device = ctx.settings, ctx.device
+    key = device_key(s.uid, domain, device)
+    ensure_device_schema(ctx.store, key, s.embed_dim)
+    model = getattr(ctx.embedder, "model_name", None) or type(ctx.embedder).__name__
+    MapWriter(ctx.store, key, s).ensure_site(domain, device, device, model, s.embed_dim)
+    if ctx.profile is not None:
+        ctx.profile.register_site(domain, device, key, ops_key(s.uid, domain), url)
+    return make_navigator(ctx.store, key, domain, ctx.browser(), s, ctx.embedder, ctx.llm, blobs=ctx.blobs,
+                          agent_id="chat-agent", ops=Ops(ctx.store, s.uid, domain),
+                          secrets=(lambda var: ctx.profile.secret_for(var, domain)) if ctx.profile else None)
+
+
+def _home_nav(ctx: ToolContext):
     nav = ctx.extra.get("nav")
     if nav is None:
         from ..agents.escalation import make_escalation
@@ -77,7 +111,10 @@ def scrub_typed(obs, typed: list[str]):
 
 def _write(ctx: ToolContext, nav, obs) -> str:
     """Write an observation to the map with anything the user typed scrubbed out first."""
-    return nav.write_state(scrub_typed(obs, ctx.extra.get("typed", [])))
+    gid = nav.write_state(scrub_typed(obs, ctx.extra.get("typed", [])))
+    ctx.extra.setdefault("dirty", {})[nav.key] = nav.domain      # graphs that grew: curated when the request ends
+    ctx.extra["state_key"] = nav.key
+    return gid
 
 
 def _ensure_page(ctx: ToolContext, nav) -> None:
@@ -134,10 +171,12 @@ def list_items(ctx: ToolContext, args: dict):
 
 
 def _after(ctx: ToolContext, nav, before: str | None, el, kind: str) -> dict:
+    before_key = ctx.extra.get("state_key")
+    nav = get_nav(ctx)                       # the click may have led to another site
     obs = nav.observe()
     after = _write(ctx, nav, obs)
     filled = ctx.extra.pop("filled", {})
-    if before and after != before:
+    if before and after != before and before_key == nav.key:    # an action never links two sites' graphs
         nav.writer.write_action(before, after, el.props(), kind, ",".join(filled.values()) or None, (), list(filled))
     ctx.extra.pop("elements", None)
     return {**_page_summary(nav, after), "page_changed": after != before,
@@ -231,6 +270,7 @@ def open_url(ctx: ToolContext, args: dict):
         raise ValueError("robots.txt does not allow opening this URL")
     nav.session.goto(url)
     ctx.extra.pop("elements", None)
+    nav = get_nav(ctx)                       # now on the new site, if it is another one
     ctx.extra["state"] = _write(ctx, nav, nav.observe())
     return {**_page_summary(nav, ctx.extra["state"]), "next": "call observe to see the page"}
 

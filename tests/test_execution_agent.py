@@ -105,7 +105,8 @@ def test_conversation_history_carries_over_between_questions(shop):
     try:
         agent.ask("hello")
         assert agent.ask("and now?").answer == "second answer"
-        assert "hello" in seen[0] and "first answer" in seen[0] and "and now?" in seen[0]
+        assert any(c.startswith("hello") for c in seen[0] if c) and "first answer" in seen[0]
+        assert any(c.startswith("and now?") for c in seen[0] if c)        # each request carries the map lookup after it
         assert "Site: " in seen[0][0] and "needs_approval" in seen[0][0]            # the system prompt describes the rules
     finally:
         agent.close()
@@ -116,5 +117,40 @@ def test_agent_without_a_chat_model_reports_a_clear_error(shop):
     try:
         run = agent.ask("hi")
         assert run.status == "error" and "no LLM configured" in run.answer
+    finally:
+        agent.close()
+
+
+def test_each_request_starts_with_an_automatic_map_lookup(shop):
+    seen = []
+    llm = ScriptedLLM([lambda m, t: seen.append([x.content for x in m if x.role == "user"]) or say("ok"),
+                       lambda m, t: seen.append([x.content for x in m if x.role == "user"]) or say("ok")])
+    agent = _agent(shop, llm)
+    try:
+        agent.ask("take me to my cart")
+        assert "Automatic map lookup" in seen[0][-1] and "not written by the user" in seen[0][-1]
+        assert "run_goal" in seen[0][-1] and "cart" in seen[0][-1].lower()
+        agent.ask("zzqx vvkk wwpp")
+        assert "No known screen" in seen[1][-1] and "observe" in seen[1][-1]
+        assert agent.ctx.extra["request_text"] == "zzqx vvkk wwpp"            # the lookup is not part of the request
+    finally:
+        agent.close()
+
+
+def test_pages_found_by_hand_are_curated_when_the_request_ends(shop):
+    store, settings, key, domain, url = shop
+    other = url.replace("127.0.0.1", "localhost")
+    other_key = device_key(settings.uid, domain_of(other), "desktop")
+    agent = _agent(shop, ScriptedLLM([call("open_url", {"url": f"{other}/about.html"}, id="o1"),
+                                      call("open_url", {"url": f"{other}/about.html"}, id="o2"),
+                                      call("observe", id="o3"), say("it is the about page")]))
+    try:
+        run = agent.ask("what is on the about page of the other host?")
+        assert run.status == "needs_approval"
+        run = agent.approve(run.pending[0]["id"])
+        assert run.status == "done", run.answer
+        assert store.ro_query(other_key, "MATCH (s:State) RETURN count(s)")[0][0] >= 1
+        assert store.ro_query(other_key, "MATCH (s:State) WHERE s.summary IS NULL RETURN count(s)") == [[0]]
+        assert not agent.ctx.extra.get("dirty")                           # nothing left to curate
     finally:
         agent.close()

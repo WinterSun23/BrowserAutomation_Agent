@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from ..browser.session import BrowserSession
 from ..db import device_key, ops_key
@@ -21,10 +22,13 @@ from ..schema import ensure_device_schema
 from ..semantic.distiller import Distiller, semantic_key
 from ..semantic.uses import exploration_priority
 from ..versions import ALGO_VERSION
+from ..policy import ExplorationPolicy
 from .curator import Curator
 from .escalation import make_curator_escalation, make_escalation
 from .factory import make_navigator
 from .navigator import ExploreReport, Navigator
+from .goal_explore import goal_priority, has_target
+from .spawner import run_scaled
 from .workflows import save_workflow_from_run
 
 KINDS = ["explore", "automate", "demo", "recommend", "save_workflow", "remember", "ask"]
@@ -57,6 +61,14 @@ def _keyword_kind(text: str) -> str:
     return "automate"
 
 
+def _nothing_new(result: dict) -> dict:
+    """An exploration that found no new action because everything on the pages it saw was tried before says so."""
+    if result.get("actions") or result.get("transitions") or not result.get("skipped_tried"):
+        return {}
+    return {"note": f"nothing new to explore: {result['skipped_tried']} clickable elements were already tried by earlier "
+                    "runs. Use --rescan (or ask to explore again with rescan) to visit them again."}
+
+
 def _clamp_agents(value) -> int | None:
     try:
         n = int(value)
@@ -72,6 +84,9 @@ class Orchestrator:
         self.pool = ThreadPoolExecutor(max_workers=max_workers)
         self.session_id = self.profile.start_session()
         self._last_run: dict[str, str] = {}
+        self.profile.policy_overrides = dict(settings.policy)          # config.yaml `policy:` block
+        ExplorationPolicy().with_overrides(self.profile.policy_overrides)   # fail now on a bad setting
+        self.on_intent = None   # optional callback(dict(kind, goal, source)) called as soon as a request is classified
 
     def register_site(self, url: str, device: str = "desktop") -> SiteInfo:
         domain = domain_of(url)
@@ -125,7 +140,7 @@ class Orchestrator:
         raise KeyError(f"unknown site {domain} ({device}); add it first")
 
     def classify(self, text: str) -> dict:
-        default = {"kind": _keyword_kind(text), "goal": text, "params": {}}
+        default = {"kind": _keyword_kind(text), "goal": text, "params": {}, "source": "keywords"}
         memories = [m for m, s in self.profile.recall(text, 3) if s >= 0.5]
         data = complete_json(self.llm, "You route requests for a website automation and demo agent.",
                              f"Classify this request: {text}\nRelevant memories: {memories}\nReturn JSON with keys: kind (one of {KINDS}), "
@@ -133,10 +148,11 @@ class Orchestrator:
                              "user gave, e.g. {\"q\": \"red shoes\"}), item (optional list item to pick), "
                              "name (optional workflow name), navigators (optional number of parallel agents the "
                              "user asked for when exploring).", default=default)
-        if not isinstance(data, dict) or data.get("kind") not in KINDS:
+        if data is default or not isinstance(data, dict) or data.get("kind") not in KINDS:
             return default
         data.setdefault("goal", text)
         data.setdefault("params", {})
+        data["source"] = "model"
         return data
 
     def submit(self, text: str, domain: str, device: str = "desktop", navigators: int | None = None) -> str:
@@ -156,15 +172,16 @@ class Orchestrator:
 
         return note
 
-    def _explore_git(self, site: SiteInfo, policy, task_id: str, n: int | None = None, seeds=None) -> dict:
+    def _explore_git(self, site: SiteInfo, policy, task_id: str, n: int | None = None, seeds=None,
+                     prioritize=None) -> dict:
         """n Navigators, each on its own branch graph, sharing one work queue; the Curator merges every branch."""
         n = max(1, min(MAX_NAVIGATORS, n or self.s.navigators_per_site))
         git = GitOps(self.store, self.s.uid, site.domain, self.s)
         ops, scope = Ops(self.store, self.s.uid, site.domain), ulid("scope")
         agents = [f"explorer-{site.device}-{i}" for i in range(n)]
         # on a site/device pair with a semantic graph behind it, look first at what resembles known important flows
-        prioritize = (exploration_priority(self.store, self.s.uid, self.embedder)
-                      if self.store.exists(semantic_key(self.s.uid)) else None)
+        prioritize = prioritize or (exploration_priority(self.store, self.s.uid, self.embedder)
+                                    if self.store.exists(semantic_key(self.s.uid)) else None)
 
         def worker(agent: str):
             br = git.fork(site.device, agent, task_id)
@@ -186,12 +203,20 @@ class Orchestrator:
                 ops.heartbeat(agent, "idle")
 
         outs, errors = [], []
-        with ThreadPoolExecutor(max_workers=n) as ex:
-            for fut in [ex.submit(worker, a) for a in agents]:
-                try:
-                    outs.append(fut.result())
-                except Exception as exc:  # one agent failing must not lose the others' work
-                    errors.append(exc)
+        if self.s.dynamic_spawn and n > 1:
+            # one explorer to start; another each time unclaimed work has been waiting, up to n
+            results, errors, spawned = run_scaled(agents, worker, lambda: ops.backlog(scope),
+                                                  min_backlog=self.s.spawn_min_backlog,
+                                                  after_s=self.s.spawn_after_s, poll_s=self.s.spawn_poll_s)
+            outs = [r for _, r in results]
+        else:
+            spawned = agents
+            with ThreadPoolExecutor(max_workers=n) as ex:
+                for fut in [ex.submit(worker, a) for a in agents]:
+                    try:
+                        outs.append(fut.result())
+                    except Exception as exc:  # one agent failing must not lose the others' work
+                        errors.append(exc)
         if not outs:
             raise errors[0]
         stats: dict = {}
@@ -210,15 +235,65 @@ class Orchestrator:
         if not stats:
             recompute()
         done = [m for m in merges if m]
-        return {"kind": "explore", "navigators": n, "agents": agents,
+        return {"kind": "explore", "navigators": n, "agents": agents, "spawned": spawned,
                 "states": len({g for _, r, _ in outs for g in r.states}),
                 "actions": sum(r.actions for _, r, _ in outs), "transitions": sum(r.transitions for _, r, _ in outs),
                 "blocked": sum(r.blocked for _, r, _ in outs), "merges": len(done),
+                "skipped_tried": sum(r.skipped_tried for _, r, _ in outs),
                 "merge_commit": done[-1].commit if done else None, "conflicts": sum(len(m.conflicts) for m in done),
                 "errors": len(errors) + sum(r.errors for _, r, _ in outs),
                 "per_agent": [{"agent": b.owner, "states": len(r.states), "actions": r.actions, "pages": r.pages,
                                "commit": c} for b, r, c in outs], "failed_agents": [str(e)[:200] for e in errors],
                 **stats}
+
+    def _state_count(self, site: SiteInfo) -> int:
+        return int(self.store.ro_query(site.key, "MATCH (s:State) RETURN count(s)")[0][0])
+
+    def explore_toward(self, site: SiteInfo, goal: str, text: str | None, policy, task_id: str,
+                       n: int | None = None) -> dict | None:
+        """If the map has no screen for `goal`, explore in rounds of a few new screens, always following first what
+        looks most like the goal, and stop as soon as a screen matches. Bounded by the policy's state and time budgets
+        and `goal_explore_max_rounds`. Returns None when nothing had to be explored."""
+        if has_target(self.store, site.key, self.embedder, goal, text, self.s.min_target_score):
+            return None
+        priority = goal_priority(self.embedder, goal)
+        goal_vec = self.embedder.embed([goal])[0]
+        t0, rounds, added, reason = time.monotonic(), 0, 0, "no new screens could be reached"
+        n = n or 1
+        while rounds < self.s.goal_explore_max_rounds:
+            left = policy.budget_s - (time.monotonic() - t0)
+            before = self._state_count(site)
+            if left <= 1:
+                reason = "the time budget was used up"
+                break
+            if before >= policy.max_states:
+                reason = "the state budget was used up"
+                break
+            frontier = frontier_states(self.store, site.key, limit=30)
+            ranked = sorted(frontier, reverse=True, key=lambda f: float(sum(
+                a * b for a, b in zip(self.embedder.embed([f["summary"] or ""])[0], goal_vec))))
+            seeds = [site.entry_url] + [u for u in (state_url(self.store, site.key, f["gid"]) for f in ranked[:10]) if u]
+            round_policy = replace(policy, max_states=min(policy.max_states, before + self.s.goal_explore_round_states),
+                                   budget_s=int(left))
+            self._explore_round(site, round_policy, task_id, n, list(dict.fromkeys(seeds)), priority)
+            rounds += 1
+            new = self._state_count(site) - before
+            added += new
+            if has_target(self.store, site.key, self.embedder, goal, text, self.s.min_target_score):
+                return {"found": True, "rounds": rounds, "states_added": added, "reason": "a matching screen was found"}
+            if new <= 0:
+                break
+        else:
+            reason = "the round limit was reached"
+        return {"found": False, "rounds": rounds, "states_added": added, "reason": reason}
+
+    def _explore_round(self, site: SiteInfo, policy, task_id: str, n: int, seeds: list[str], priority) -> None:
+        if self.s.use_git:
+            self._explore_git(site, policy, task_id, n, seeds, prioritize=priority)
+            return
+        self._explore(site, policy, task_id, n)
+        Curator(self.store, site.key, self.s, self.embedder, self.llm).run_all(
+            policy.max_risk_cost, escalate=make_curator_escalation(self.s, self.store, site.key, self.embedder, self.llm))
 
     def rebuild_semantic(self) -> dict:
         return Distiller(self.store, self.s.uid, self.embedder, self.llm, self.s, self.profile).rebuild()
@@ -251,12 +326,19 @@ class Orchestrator:
 
         reports: list[ExploreReport] = []
         errors: list[Exception] = []
-        with ThreadPoolExecutor(max_workers=n) as ex:
-            for fut in [ex.submit(worker, a) for a in agents]:
-                try:
-                    reports.append(fut.result())
-                except Exception as exc:  # one agent failing must not lose the others' work
-                    errors.append(exc)
+        if self.s.dynamic_spawn and n > 1:
+            ops = Ops(self.store, self.s.uid, site.domain)
+            results, errors, agents = run_scaled(agents, worker, lambda: ops.backlog(scope),
+                                                 min_backlog=self.s.spawn_min_backlog,
+                                                 after_s=self.s.spawn_after_s, poll_s=self.s.spawn_poll_s)
+            reports = [r for _, r in results]
+        else:
+            with ThreadPoolExecutor(max_workers=n) as ex:
+                for fut in [ex.submit(worker, a) for a in agents]:
+                    try:
+                        reports.append(fut.result())
+                    except Exception as exc:  # one agent failing must not lose the others' work
+                        errors.append(exc)
         if not reports:
             raise errors[0]
         merged = ExploreReport(run_gid=reports[0].run_gid)
@@ -266,11 +348,15 @@ class Orchestrator:
             merged.transitions += r.transitions
             merged.blocked += r.blocked
             merged.pages += r.pages
+            merged.skipped_tried += r.skipped_tried
             merged.errors += r.errors
         merged.errors += len(errors)
         return merged, agents
 
-    def run_task(self, task_id: str, text: str, site: SiteInfo, navigators: int | None = None) -> dict:
+    def run_task(self, task_id: str, text: str, site: SiteInfo, navigators: int | None = None,
+                 kind: str | None = None, rescan: bool = False) -> dict:
+        """`kind` skips the classification and forces that kind of request; `rescan` makes an exploration visit
+        elements that earlier runs already tried."""
         ops = Ops(self.store, self.s.uid, site.domain)
         agent = f"navigator-{site.device}"
         ops.register_agent(agent, "navigator", site.device)
@@ -280,8 +366,18 @@ class Orchestrator:
         policy = self.profile.policy_for(site.domain, site.device)
         secrets = lambda var: self.profile.secret_for(var, site.domain)  # noqa: E731
         try:
-            intent = self.classify(text)
+            if kind:
+                if kind not in KINDS:
+                    raise ValueError(f"unknown request kind '{kind}' (one of {', '.join(KINDS)})")
+                intent = {"kind": kind, "goal": text, "params": {}, "source": "override"}
+            else:
+                intent = self.classify(text)
             kind = intent["kind"]
+            if self.on_intent:
+                try:
+                    self.on_intent({"kind": kind, "goal": intent.get("goal") or text, "source": intent["source"]})
+                except Exception:
+                    pass
             if kind == "demo":
                 d = DemoDirector(self.store, site.key, site.domain, self.s, self.embedder, self.llm, self.blobs,
                                  self.profile, site.device,
@@ -304,11 +400,14 @@ class Orchestrator:
                                             intent.get("name") or intent["goal"], intent["goal"])
                 result = {"kind": kind, "workflow": wf}
             elif kind == "explore":
+                if rescan:
+                    self.store.query(site.key, "MATCH (x:Element) WHERE x.tried = true SET x.tried = false")
                 # precedence: explicit argument > number named in the request > settings.navigators_per_site
                 n = _clamp_agents(navigators) or _clamp_agents(intent.get("navigators")) \
                     or _clamp_agents(self.s.navigators_per_site) or 1
                 if self.s.use_git:
                     result = self._explore_git(site, policy, task_id, n)
+                    result.update(_nothing_new(result), policy=policy.to_dict())
                 else:
                     for i in range(1, n + 1):
                         ops.register_agent(f"navigator-{site.device}-{i}", "navigator", site.device)
@@ -318,8 +417,11 @@ class Orchestrator:
                         escalate=make_curator_escalation(self.s, self.store, site.key, self.embedder, self.llm))
                     result = {"kind": kind, "states": len(rep.states), "actions": rep.actions,
                               "transitions": rep.transitions, "blocked": rep.blocked, "navigators": n,
-                              "agents": agents, **stats}
+                              "agents": agents, "skipped_tried": rep.skipped_tried, **stats}
+                    result.update(_nothing_new(result), policy=policy.to_dict())
             else:
+                searched = (self.explore_toward(site, intent["goal"], text, policy, task_id, navigators)
+                            if self.s.goal_explore and kind in ("automate", "ask") else None)
                 git = GitOps(self.store, self.s.uid, site.domain, self.s) if self.s.use_git else None
                 writer = git.main_recorder(site.device) if git else None
                 if git:
@@ -344,6 +446,8 @@ class Orchestrator:
                         explanation = (self.explain_with_blame(site, res.route) if git else "") or res.explanation
                         result = {"kind": "automate", "status": res.status, "explanation": explanation,
                                   "heals": res.heals, "replans": res.replans, "run": res.run_gid}
+                    if searched:
+                        result["goal_explore"] = searched
                     if git:
                         result["exec_commit"] = git.commit_main(site.device, writer, agent, f"exec: {intent['goal']}")
             ops.set_status(task_id, "done", result)

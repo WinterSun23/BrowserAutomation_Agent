@@ -55,7 +55,7 @@ MERGE (x:Element {gid:e.gid})
 SET x.first_seen = coalesce(x.first_seen, $now), x.last_seen = $now, x.tried = coalesce(x.tried, false),
     x.heal_count = coalesce(x.heal_count, 0), x.role = e.role, x.name_norm = e.name_norm, x.tag = e.tag,
     x.is_template = e.is_template, x.count = e.count, x.risk = e.risk, x.risk_cost = e.risk_cost,
-    x.input_kind = e.input_kind, x.href_template = e.href_template, x.in_form = e.in_form,
+    x.input_kind = e.input_kind, x.href_template = e.href_template, x.in_form = e.in_form, x.inferred = e.inferred,
     x.item_locator = e.item_locator, x.item_key_fields = e.item_key_fields, x.sample_items = e.sample_items,
     x.fingerprint = e.fingerprint, x.locators = CASE WHEN x.locators IS NULL THEN e.locators
         ELSE x.locators + [l IN e.locators WHERE NOT l IN x.locators] END

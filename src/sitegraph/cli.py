@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from .agents.execution_agent import ExecutionAgent
 from .agents.loop import AgentRun
 from .agents.orchestrator import Orchestrator
+from .policy import ExplorationPolicy
 from .blobs import BlobStore
 from .config import Settings, load_settings
 from .db import GraphStore
@@ -64,6 +65,23 @@ def build_runtime(args: argparse.Namespace, quiet: bool = False) -> Runtime | No
                    TracingLLM(llm, settings.data_dir / "traces", redact=redact), BlobStore(settings.blob_dir))
 
 
+def _policy_flags(p: argparse.ArgumentParser) -> None:
+    g = p.add_argument_group("exploration policy (override config.yaml `policy:` and the saved policy for this run)")
+    g.add_argument("--max-depth", type=int, help="how many page hops from the entry page to follow")
+    g.add_argument("--max-states", type=int, help="stop after this many screens")
+    g.add_argument("--max-actions", type=int, help="stop after this many recorded actions and transitions")
+    g.add_argument("--budget", type=int, help="time budget for one exploration, in seconds")
+
+
+def apply_policy_flags(profile, args: argparse.Namespace) -> None:
+    """Command-line policy flags beat the config.yaml block, which beats the saved policies. Raises ValueError on a
+    bad value. Nothing is written to the graph."""
+    flags = {"max_depth": args.max_depth, "max_states": args.max_states, "max_actions": args.max_actions,
+             "budget_s": args.budget}
+    profile.policy_overrides = {**profile.policy_overrides, **{k: v for k, v in flags.items() if v is not None}}
+    ExplorationPolicy().with_overrides(profile.policy_overrides)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m sitegraph", description="SiteGraph: explore, automate and demo a website.")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -72,16 +90,22 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("requests", nargs="+", help='e.g. "explore the site" "open cart" "make a gif of the menu"')
     r.add_argument("--device", default="desktop", choices=["desktop", "tablet", "phone"])
     r.add_argument("--navigators", type=int, help="how many agents explore in parallel (default: config.yaml)")
+    r.add_argument("--kind", choices=["explore", "automate", "demo", "recommend", "save_workflow", "remember", "ask"],
+                   help="treat every request as this kind instead of letting the model or keywords decide")
+    r.add_argument("--rescan", action="store_true",
+                   help="when exploring, visit elements that earlier runs already tried")
     r.add_argument("--embedder", default="bge", choices=["bge", "hash"],
                    help="bge = real semantic model (downloads ~130 MB once); hash = offline, weak, for quick tests")
     r.add_argument("--config", default="config.yaml")
     r.add_argument("--uid", help="user id that namespaces the graphs (default: config.yaml)")
+    _policy_flags(r)
     c = sub.add_parser("chat", help="talk to an agent that explores, operates and demos the site with tools")
     c.add_argument("site", help="entry URL of a public website")
     c.add_argument("--device", default="desktop", choices=["desktop", "tablet", "phone"])
     c.add_argument("--embedder", default="bge", choices=["bge", "hash"])
     c.add_argument("--config", default="config.yaml")
     c.add_argument("--uid", help="user id that namespaces the graphs (default: config.yaml)")
+    _policy_flags(c)
     c.add_argument("--no-agent", action="store_true", help="skip the LLM agent and use the fixed request pipeline")
     m = sub.add_parser("mcp", help="serve the tools over MCP (stdio) so an MCP client such as Claude Desktop can use them")
     m.add_argument("site", help="entry URL of a public website")
@@ -98,14 +122,20 @@ def run(args: argparse.Namespace) -> int:
     if rt is None:
         return 2
     settings, store, embedder, llm = rt.settings, rt.store, rt.embedder, rt.llm
-    orch = Orchestrator(settings, store, embedder, llm, rt.blobs, NullEvents())
+    try:
+        orch = Orchestrator(settings, store, embedder, llm, rt.blobs, NullEvents())
+        apply_policy_flags(orch.profile, args)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
     site = orch.register_site(args.site, args.device)
     ops = Ops(store, settings.uid, site.domain)
     failed = False
+    orch.on_intent = lambda i: print(f"-> {i['kind']} (goal: {i['goal']}; chosen by {i['source']})", file=sys.stderr)
     for text in args.requests:
         print(f"\n== {text}", file=sys.stderr)
         task = ops.create_task("chat", text, device=args.device)
-        result = orch.run_task(task, text, site, args.navigators)
+        result = orch.run_task(task, text, site, args.navigators, kind=args.kind, rescan=args.rescan)
         print(json.dumps(result, indent=2, default=str))
         failed = failed or result.get("kind") == "error"
     print(f"\nGraphs: {site.key}, {site.ops_key}, u:{settings.uid}:profile   Files: {settings.data_dir}",
@@ -139,7 +169,12 @@ def chat(args: argparse.Namespace, input_fn=None, write=print) -> int:
     if rt is None:
         return 2
     settings, store, embedder, llm, blobs = rt.settings, rt.store, rt.embedder, rt.llm, rt.blobs
-    orch = Orchestrator(settings, store, embedder, llm, blobs, NullEvents())
+    try:
+        orch = Orchestrator(settings, store, embedder, llm, blobs, NullEvents())
+        apply_policy_flags(orch.profile, args)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
     site = orch.register_site(args.site, args.device)
     use_agent = can_call_tools(llm) and not args.no_agent
     agent = ExecutionAgent(settings, store, embedder, llm, blobs, site, orch.profile) if use_agent else None

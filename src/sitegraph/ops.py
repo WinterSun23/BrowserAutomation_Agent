@@ -101,6 +101,12 @@ class Ops:
             self.release(g, agent_id)  # finished by someone else between our read and our claim
         return None, True
 
+    def backlog(self, scope: str) -> int:
+        """Open work items nobody holds a claim on (what an extra explorer could start on right now)."""
+        rows = self.q("MATCH (w:WorkItem {scope:$s, status:'open'}) OPTIONAL MATCH (c:Claim {target_gid:w.gid}) "
+                      "WITH w, c WHERE c IS NULL RETURN count(w)", s=scope)
+        return int(rows[0][0]) if rows else 0
+
     def finish_item(self, item_gid: str, agent_id: str, error: str | None = None) -> None:
         self.q("MATCH (w:WorkItem {gid:$g}) SET w.status = 'done', w.done_by = $a, w.error = $e, "
                "w.attempts = coalesce(w.attempts, 0) + 1", g=item_gid, a=agent_id, e=error)

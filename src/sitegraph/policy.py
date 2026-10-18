@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from urllib.parse import urlsplit
 from urllib.robotparser import RobotFileParser
 
@@ -34,6 +34,41 @@ class ExplorationPolicy:
         name = el["name_sample"] if isinstance(el, dict) else el.name_sample
         href = (el.get("href_template") if isinstance(el, dict) else el.href_template) or ""
         return not any(re.search(p, f"{name} {href}", re.I) for p in self.deny_patterns)
+
+    def with_overrides(self, overrides: dict) -> "ExplorationPolicy":
+        """A copy with the given fields replaced (per-run settings from config.yaml or command-line flags)."""
+        if not overrides:
+            return self
+        values = {}
+        for key, raw in overrides.items():
+            if key not in self.__dataclass_fields__ or key == "name":
+                raise ValueError(f"unknown policy setting '{key}' (one of: "
+                                 f"{', '.join(k for k in self.__dataclass_fields__ if k != 'name')})")
+            current = getattr(self, key)
+            try:
+                if isinstance(current, bool):
+                    if isinstance(raw, str) and raw.lower() not in ("true", "false", "1", "0", "yes", "no"):
+                        raise ValueError
+                    value = raw if isinstance(raw, bool) else str(raw).lower() in ("true", "1", "yes")
+                elif isinstance(current, int):
+                    value = int(raw)
+                    if value < 0:
+                        raise ValueError
+                elif isinstance(current, list):
+                    if not isinstance(raw, (list, tuple)) or not all(isinstance(x, str) for x in raw):
+                        raise ValueError
+                    value = list(raw)
+                    for pattern in value if key == "deny_patterns" else []:
+                        re.compile(pattern)
+                else:
+                    value = str(raw)
+                    if key == "max_risk" and value not in RISK_COST:
+                        raise ValueError
+            except (ValueError, TypeError, re.error):
+                hint = f" (one of: {', '.join(RISK_COST)})" if key == "max_risk" else ""
+                raise ValueError(f"bad value for policy setting '{key}': {raw!r}{hint}") from None
+            values[key] = value
+        return replace(self, **values)
 
     def to_dict(self) -> dict:
         return asdict(self)

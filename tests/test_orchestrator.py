@@ -62,3 +62,55 @@ def test_number_of_navigators_is_configurable(store, settings, site_url, explici
     res = o.run_task(t, "explore the site", site, navigators=explicit)
     assert res["kind"] == "explore", res
     assert res["navigators"] == expected and len(res["agents"]) == expected
+
+
+@pytest.mark.integration
+@pytest.mark.browser
+@pytest.mark.parametrize("min_backlog, expected_spawned", [(1, 3), (10_000, 1)])
+def test_explorers_are_started_as_the_backlog_grows(store, settings, site_url, min_backlog, expected_spawned):
+    settings.navigators_per_site, settings.spawn_after_s, settings.spawn_poll_s = 3, 0.0, 0.05
+    settings.spawn_min_backlog = min_backlog
+    o = Orchestrator(settings, store, HashEmbedder(), _llm(), BlobStore(settings.blob_dir), NullEvents())
+    site = o.register_site(site_url + "/index.html")
+    ops = Ops(store, settings.uid, site.domain)
+    t = ops.create_task("chat", "explore the site")
+    res = o.run_task(t, "explore the site", site)
+    assert res["kind"] == "explore" and res["navigators"] == 3, res
+    assert len(res["agents"]) == 3                                  # the allowed maximum
+    assert len(res["spawned"]) <= 3 and (len(res["spawned"]) == 1) == (expected_spawned == 1)
+    assert res["states"] >= 5
+
+
+def test_the_classification_is_reported_before_the_work_and_can_be_overridden(store, settings, site_url):
+    o = Orchestrator(settings, store, HashEmbedder(), FakeLLM(lambda s, u: "nope"), BlobStore(settings.blob_dir),
+                     NullEvents())
+    site = o.register_site(site_url + "/index.html")
+    ops = Ops(store, settings.uid, site.domain)
+    seen = []
+    o.on_intent = seen.append
+    t = ops.create_task("chat", "remember that I like gifs")
+    res = o.run_task(t, "remember that I like gifs", site)
+    assert res["kind"] == "remember" and seen[0]["kind"] == "remember" and seen[0]["source"] == "keywords"
+    t2 = ops.create_task("chat", "I prefer short videos")
+    res2 = o.run_task(t2, "I prefer short videos", site, kind="remember")        # forced: no classification at all
+    assert res2["kind"] == "remember" and seen[1] == {"kind": "remember", "goal": "I prefer short videos",
+                                                      "source": "override"}
+    t3 = ops.create_task("chat", "x")
+    bad = o.run_task(t3, "x", site, kind="nonsense")
+    assert bad["kind"] == "error" and "nonsense" in bad["error"]
+
+
+@pytest.mark.integration
+@pytest.mark.browser
+def test_a_second_exploration_says_nothing_is_new_and_rescan_explores_again(store, settings, site_url):
+    settings.navigators_per_site, settings.dynamic_spawn = 1, False
+    o = Orchestrator(settings, store, HashEmbedder(), _llm(), BlobStore(settings.blob_dir), NullEvents())
+    site = o.register_site(site_url + "/index.html")
+    ops = Ops(store, settings.uid, site.domain)
+    first = o.run_task(ops.create_task("chat", "explore the site"), "explore the site", site)
+    assert first["actions"] > 0 and "note" not in first
+    second = o.run_task(ops.create_task("chat", "explore the site"), "explore the site", site)
+    assert second["actions"] == 0 and second["skipped_tried"] > 0
+    assert "nothing new to explore" in second["note"] and "--rescan" in second["note"]
+    third = o.run_task(ops.create_task("chat", "explore the site"), "explore the site", site, rescan=True)
+    assert third["actions"] > 0 and "note" not in third

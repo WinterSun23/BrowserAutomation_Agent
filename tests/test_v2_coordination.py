@@ -24,6 +24,7 @@ def _llm():
 
 def test_git_explore_parallel_exec_commits_handoff_notes(store, settings, site_url):
     settings.min_target_score = 0.3
+    settings.dynamic_spawn = False        # this test is about merging two branches, so both must run
     o = Orchestrator(settings, store, HashEmbedder(), _llm(), BlobStore(settings.blob_dir), NullEvents())
     site = o.register_site(site_url + "/index.html")
     ops = Ops(store, settings.uid, site.domain)

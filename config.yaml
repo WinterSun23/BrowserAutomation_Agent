@@ -12,15 +12,25 @@ max_replans: 3
 template_min_items: 4
 min_target_score: 0.35
 sample_input_text: test
-headless: true
-navigators_per_site: 2
+headless: false
+navigators_per_site: 3
 claim_ttl_ms: 120000
 claim_wait_s: 5
 claim_retries: 3
+goal_explore: true
+goal_explore_round_states: 12
+goal_explore_max_rounds: 8
+dynamic_spawn: true
+spawn_min_backlog: 4
+spawn_after_s: 3
+spawn_poll_s: 0.5
 max_scrolls: 8
-max_path_len: 2
+max_path_len: 15
 agent_max_steps: 60
 agent_max_tokens: 400000
+agent_repeat_limit: 5
+agent_keep_observations: 2
+chat_learn: true
 escalate_navigator: true
 max_escalations_per_run: 5
 escalation_max_steps: 30
@@ -30,3 +40,9 @@ anomaly_dup_low: 0.6
 anomaly_states_per_page: 8
 anomaly_edge_min_seen: 5
 anomaly_edge_reliability: 0.4
+# Per-run overrides of the exploration policy (command-line --max-depth/--max-states/--max-actions/--budget beat these;
+# nothing is written to the graph). Fields: max_depth, max_states, max_actions, budget_s, max_risk, allow_forms,
+# deny_patterns, allowed_domains, respect_robots.
+# policy:
+#   max_depth: 6
+#   budget_s: 600

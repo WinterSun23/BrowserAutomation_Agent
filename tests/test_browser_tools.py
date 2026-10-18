@@ -212,3 +212,43 @@ def test_make_demo_wraps_the_director(box, monkeypatch):
     monkeypatch.setattr(demo_agent, "DemoDirector", StubDirector)
     r = box.call("make_demo", {"request": "gif of the menu"})
     assert r.ok and r.data["storyboard"] == "sb:1" and r.data["renders"] == [{"format": "gif", "file": "abc.gif"}]
+
+
+def _other_site(shop):
+    """The same test server under another host name: a different domain for the guard."""
+    url = shop[4].replace("127.0.0.1", "localhost")
+    return url, domain_of(url)
+
+
+def test_pages_of_another_site_go_to_that_sites_own_graph(box, shop):
+    store, settings, key, domain, _ = shop
+    other_url, other_domain = _other_site(shop)
+    other_key = device_key(settings.uid, other_domain, "desktop")
+    _open(box, shop, "index.html")
+    home_states = store.ro_query(key, "MATCH (s:State) RETURN count(s)")[0][0]
+    away = box.call("open_url", {"url": f"{other_url}/products.html"})
+    assert away.needs_approval and "leaves the explored site" in away.needs_approval["reason"]
+    box.ctx.approvals.approve(away.needs_approval["id"])
+    away = box.call("open_url", {"url": f"{other_url}/products.html"})
+    assert away.ok, away.error
+    seen = box.call("observe", {})
+    assert seen.ok, seen.error
+    # nothing of the other site was written to the explored site's graph; it has a graph of its own
+    assert store.ro_query(key, "MATCH (s:State) RETURN count(s)")[0][0] == home_states
+    assert store.ro_query(other_key, "MATCH (s:State) RETURN count(s)")[0][0] >= 1
+    assert box.ctx.extra["dirty"][other_key] == other_domain
+    # links of that page are judged against ITS domain: they are not 'external'
+    links = [e for e in seen.data["elements"] if e["role"] == "link"]
+    assert links and all(e["risk"] != "external" for e in links)
+    # clicking there records the action in the other site's graph only
+    home_actions = store.ro_query(key, "MATCH ()-[r:ACTION]->() RETURN count(r)")[0][0]
+    clicked = box.call("click", {"element_id": links[0]["id"]})
+    assert clicked.ok, clicked.error
+    assert store.ro_query(key, "MATCH ()-[r:ACTION]->() RETURN count(r)")[0][0] == home_actions
+    assert domain_of(clicked.data["url"]) == other_domain
+
+
+def test_explore_toward_returns_at_once_when_the_map_already_has_the_screen(box):
+    res = box.call("explore_toward", {"goal": "open cart"})
+    assert res.ok, res.error
+    assert res.data == {"found": True, "rounds": 0, "states_added": 0, "reason": "the map already has a matching screen"}

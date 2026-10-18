@@ -127,3 +127,45 @@ def test_a_tool_can_ask_the_user_a_question_and_end_the_turn():
     run = AgentLoop(llm, box, "sys").run("make a demo", history)
     assert run.status == "needs_input" and run.answer == "Which format do you want?" and run.steps == 1
     assert history[-1].role == "tool" and len(llm.calls) == 1                  # the tool call was answered; no second model call
+
+
+def test_a_call_repeated_with_the_same_result_is_warned_about_then_stops_the_run():
+    seen = []
+    llm = ScriptedLLM([lambda m, t, i=i: seen.append(m[-1].content) or call("echo", {"msg": "x"}, id=f"c{i}")
+                       for i in range(8)])
+    run = AgentLoop(llm, _box(), "sys", repeat_limit=5).run("go")
+    assert run.status == "stuck" and run.steps == 5 and len(run.tool_calls) == 5
+    assert "echo" in run.answer and "5 times" in run.answer
+    assert "repeated" not in seen[2] and "repeated" in seen[3] and "repeated" in seen[4]      # warned from the 3rd repeat
+
+
+def test_different_arguments_or_results_are_not_repeats():
+    llm = ScriptedLLM([call("echo", {"msg": f"m{i}"}, id=f"c{i}") for i in range(8)] + [say("done")])
+    run = AgentLoop(llm, _box(), "sys", repeat_limit=3).run("go")
+    assert run.status == "done" and len(run.tool_calls) == 8
+
+
+def _observing_box():
+    n = {"i": 0}
+
+    def observe(ctx, args):
+        n["i"] += 1
+        return {"page": f"page-{n['i']}"}
+
+    box = Toolbox(ToolContext(settings=Settings()))
+    box.register(ToolSpec("observe", "Look", {"type": "object", "properties": {}}, observe, "read"))
+    return box
+
+
+def test_only_the_latest_observations_are_sent_to_the_model_again():
+    sent = []
+    steps = [lambda m, t, i=i: sent.append([x.content for x in m if x.role == "tool"]) or call("observe", id=f"c{i}")
+             for i in range(5)] + [lambda m, t: sent.append([x.content for x in m if x.role == "tool"]) or say("ok")]
+    llm = ScriptedLLM(steps)
+    history: list = []
+    run = AgentLoop(llm, _observing_box(), "sys", keep_observations=2).run("look around", history)
+    assert run.status == "done"
+    last = sent[-1]
+    assert len(last) == 5 and [("removed" in c) for c in last] == [True, True, True, False, False]
+    assert "page-4" in last[3] and "page-5" in last[4]
+    assert all("page-" in m.content for m in history if m.role == "tool")              # the stored history is complete

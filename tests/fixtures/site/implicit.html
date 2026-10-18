@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Implicit clickables</title>
+  <style>
+    .pointer { cursor: pointer; }
+    .big { width: 100%; height: 90vh; }
+  </style>
+</head>
+<body>
+  <h1>Implicit clickables</h1>
+  <p id="out">nothing clicked</p>
+
+  <!-- no role, found by a cheap hint -->
+  <div onclick="document.getElementById('out').textContent='onclick clicked'">Attribute handler</div>
+  <div class="btn primary">Class button</div>
+  <div tabindex="0">Focusable thing</div>
+  <span class="pointer">Pointer cursor</span>
+
+  <!-- no role, no hint: only an event listener added from script reveals it -->
+  <div id="listener">Script listener</div>
+  <div id="icon-only" style="width:20px;height:20px"></div>
+
+  <!-- a wrapper with a listener that holds a real link: the link is the target, not the wrapper -->
+  <div id="wrapper"><a href="products.html">Real link</a></div>
+
+  <!-- a pointer cursor inherited by children counts once, at the element where it starts -->
+  <div class="pointer" id="card"><span>Card title</span><span>Card price</span></div>
+
+  <!-- a listener on a page-sized container is a delegation point, not a button -->
+  <div id="page-wrap" class="big">Large container</div>
+
+  <div>Plain text that nothing listens to</div>
+
+  <script>
+    document.getElementById('listener').addEventListener('click', () => {
+      document.getElementById('out').textContent = 'listener clicked';
+    });
+    document.getElementById('icon-only').addEventListener('click', () => {});
+    document.getElementById('wrapper').addEventListener('click', () => {});
+    document.getElementById('page-wrap').addEventListener('click', () => {});
+    document.body.addEventListener('click', () => {});
+  </script>
+</body>
+</html>

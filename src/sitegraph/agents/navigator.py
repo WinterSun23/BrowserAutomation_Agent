@@ -31,6 +31,7 @@ class ExploreReport:
     blocked: int = 0
     pages: int = 0
     errors: int = 0
+    skipped_tried: int = 0   # clickable elements left out because an earlier run already tried them
 
 
 @dataclass
@@ -183,6 +184,7 @@ class Navigator:
         out = []
         for e in els:
             if e.gid in tried:
+                report.skipped_tried += 1
                 continue
             if not policy.allows(e):
                 report.blocked += 1
