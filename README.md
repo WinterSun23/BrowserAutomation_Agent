@@ -2,9 +2,14 @@
 
 SiteGraph is a Python agent system that explores a public website into a **FalkorDB graph**, then uses graph algorithms to plan routes, recommend automations, run them (and keep them working when the UI changes), and turn paths in the graph into demos (video, GIF, screenshot, step guide, click-through).
 
-**Hackathon tracks:** T1 *Agents That Act on Connected Data* (primary) and T2 *Agent Memory & Coordination* (coordination is real: shared work items, claims and tasks in a graph; long-term memory is only partly built, see [Known limits](#known-limits)).
+**Hackathon tracks:** T1 *Agents That Act on Connected Data* (primary) and T2 *Agent Memory & Coordination*:
+- **Coordination:** several explorers each work on their own branch of the graph, take work from one shared queue, and are merged by the Curator, with a commit history and `blame` for every change.
+- **Memory:** limited. The user's memories, preferences and session summaries are kept and shown to the chat agent, but little is learned automatically. See [Known limits](#known-limits).
 
-> **Status:** the engine, graph, command line, LLM agents and MCP server are built. The web API and web UI (plan tasks 18-19) are **not built**; use the command line below. The agents pass their scripted-model tests and a first live check with a small local model (see [Known limits](#known-limits)).
+> **Status:**
+> - **Built and tested with scripted models:** the engine, the graph with git-style history, the agents and the MCP server.
+> - **Run live** on books.toscrape.com and the-internet.herokuapp.com: through the command line, through MCP with Claude as the agent, and with a small local model.
+> - **The web console lives in a separate repository** (`BrowserAgent-Frontend`, a WebSocket bridge that imports this package). This repository has no web server.
 
 ## Demo video
 
@@ -284,15 +289,27 @@ The deterministic engine stays the fast, cheap, no-LLM path. LLM agents sit on t
 | Component | What it is | LLM agent |
 |---|---|---|
 | **Execution agent** (`chat`) | You ask for things in plain language; it calls tools (find screens, plan/run routes, observe/click/hover/fill, explore, demos, memory) | Full agent |
-| **Navigator** | Rule-based explorer/executor that heals stale locators itself | Escalates to a **recovery agent** when stuck (cookie wall, blocking overlay, element gone): it gets the goal, the failed step, the page, a screenshot and what was tried, with a restricted browser toolbox |
+| **Navigator** | Explorer and executor. It heals stale locators itself and replays steps learned from earlier recoveries. With a model it can explore *guided*: the model picks which group of unexplored links to follow next | Escalates to a **recovery agent** when stuck (cookie wall, blocking overlay, element gone): it gets the goal, the failed step, the page, a screenshot and what was tried, with a restricted browser toolbox |
 | **Curator** | Algorithms, summaries, features, retention | Escalates to a **review agent** for anomalies it cannot settle by rule (near-duplicate states, clashing names, state explosion, failing actions); it may merge states, rename/re-summarise and quarantine or restore actions, each edit with a logged reason |
 | **Demo Director** | Records and renders demos | Full **Demo agent**: chooses shots, records them one by one, looks at previews and retakes bad ones, writes captions, renders video / GIF / screenshot / guide / click-through, and may ask you a question. The fixed pipeline remains the fallback with no LLM |
-| **Orchestrator** | Routes requests of the fixed pipeline | none |
+| **Orchestrator** | Turns a request into tasks for the other components | With a model it:<br>- splits a request into steps;<br>- profiles a new site before exploring it (from robots.txt, the sitemap and the entry page);<br>- chooses between brute-force and guided exploration;<br>- searches toward a screen the map does not have yet;<br>- checks the result: a *verify* step must quote evidence that is really on the page. |
+
+### Demo videos
+
+With a model that can call tools, a demo request ("make a video showing how to find the cheapest Mystery book") runs in four phases:
+
+1. **Rehearse.** The Demo agent works the task out on the live site like a user would, by trial and error. Nothing is recorded, and every action that worked is logged.
+2. **Script.** From the actions that worked, it writes a script: a title, an intro, an outro and one scene per step. Each caption explains the step (why it is done, what to notice) rather than just naming the click. Dead ends are left out. The script is saved as `script.md`, and the user can approve it or ask for changes before anything is recorded (`demo_approve_script`).
+3. **Final take.** The script is replayed in a fresh browser as one continuous recording: a title card, then each scene with its step number, caption, highlighted element and reading pause, then a closing card. If a scene fails, the take is thrown away and recorded again (`demo_retakes`).
+4. **Render.** The take becomes a video, GIF, step guide, Markdown guide or click-through. A spoken voice-over is added with `pip install .[tts]`.
+
+Without a model, the fixed pipeline plans a demo from the graph's routes and records it with plain captions.
 
 Safety model (all inside the tools):
 - Every browser action is checked against the active exploration policy; above the allowed risk level it needs your one-time approval for that exact action (terminal prompt, or MCP elicitation). Approvals are never granted by a model.
 - Page and site text is passed to models marked as untrusted data, trimmed in length.
-- Typed values are never stored: `fill` remembers only a variable name, the value is scrubbed from URLs, titles and names before anything is written, and `Toolbox.redacted` hides it from logs. Password fields are refused.
+- Typed values are never stored: `fill` remembers only a variable name, the value is scrubbed from URLs, titles and names before anything is written, and `Toolbox.redacted` hides it from logs and traces.
+- Sensitive fields are never filled from a request or by a model. That means passwords, email, phone, payment, address and personal-name fields, recognised by input type, autocomplete hint or name. A stored secret can be typed with `fill(from_secret=...)` without its value reaching the model.
 - Memory (`remember` / `recall` / `list_memories` / `forget`) refuses passwords, keys, emails and long numbers, and you can review and delete what is saved.
 - Limits per request (configurable): 60 model turns, ~400k tokens, 5 recovery attempts per run, 20 curator edits per review.
 - A model that cannot call tools, or no model at all, disables the agents and the fixed pipeline runs instead.
@@ -309,7 +326,7 @@ Built with Claude Code (Anthropic) as a coding assistant; the graph model, queri
 
 ```bash
 pytest -m "not slow"     # skips video/GIF recording
-pytest                   # full suite; needs Docker (FalkorDB) and Chromium; about 18 minutes; never reads .env
+pytest                   # full suite; needs Docker (FalkorDB) and Chromium; about 30 minutes; never reads .env
 pytest -m llm            # live-model test; set LLM_MODEL and LLM_API_KEY (or LLM_API_BASE) in the environment, skipped otherwise
 ```
 
@@ -317,17 +334,15 @@ Integration and browser tests are skipped (not failed) when FalkorDB is not runn
 
 ## Known limits
 
-- **No web UI/API yet** (plan tasks 18-19).
-- Actions supported: click, hover (desktop menus), text fill in forms (opt-in), auto-scroll to load lazy content. Not yet: `<select>` choice, checkbox/radio toggling, keyboard, drag/slider, touch gestures, virtualised-list scrolling.
-- **Live-model testing is limited.** Every agent passes its scripted-model tests (full suite: 206 passed). A first live check used a small local model (`qwen3:4b` through Ollama: tool calling, no vision): the live tool-call test passes, "take me to the travel category" and "find the cheapest book and open it" succeed, and "go to checkout" stays safe. The vision paths (Demo agent previews, Navigator recovery from a screenshot) have not been run against a real model. Results are in `docs/eval-agent-layer.md` (local, not in the repository).
-- Memory: the chat agent can `remember` / `recall` / `forget`, but only when asked or clearly useful; nothing learns preferences automatically and the fixed pipeline does not use memory, so the memory half of T2 is limited.
-- A recovery agent that needs your approval (for example a banner whose only button is destructive) cannot ask you mid-run: the step fails and the reason is recorded.
-- What the recovery agent did to get past an obstacle (closing a banner, choosing an option) is saved on that route step and replayed when the obstacle is on the page, so later runs need no model. Only actions within the allowed risk level are learned, and an obstacle whose element changes is recovered from again.
-- An element that appears late (timer, banner) is stored in the graph but only explored by a later run.
-- Exploration is slow (each path replays from a fresh page load); reusing a live page that already matches is a possible speed-up.
-- **Real-site quality is only partly proven.** Smoke tests on `books.toscrape.com` (no LLM configured, real `bge` embeddings, 2 agents, 7 states / ~10 actions) now handle "open the travel category", "take me to the mystery category" and "open philosophy" (item 33 of 50): pages that share a URL pattern stay one state (named after the last page seen, with a capped list of example titles), and the item is chosen from the live list by (1) text in the request, (2) meaning, (3) an LLM, else (4) the first item. Not yet tested: a real LLM, product pages (cards rather than plain links, where list-item text includes price and buttons), and the plan's "make a video showing how to open a book's page".
-  Without an LLM, request routing and summaries are keyword/title based, so matching by meaning is weak (items named in the request work well; paraphrases do not). Formats named in a demo request (gif, video, guide, screenshot, click-through) are honoured even offline.
-
-## Roadmap (designed, not built)
-
-Git-style branching and merging of the graph, a cross-site/cross-device semantic graph, multi-device alignment, repair and A/B simulation of UI redesigns, a UI-design helper, a docs generator, a benchmark against other agents, and the web UI/API. (The MCP server is built.)
+- **Limited live testing.** Runs on real sites so far are books.toscrape.com and the-internet.herokuapp.com, with Claude (through MCP) and a small local model. The vision features have not been tried with a real vision model.
+- **Some browser actions are missing:** drag and drop, sliders, touch gestures, file uploads and lists that remove entries as you scroll.
+- **Public pages only.** Pages behind a login are skipped.
+- **Exploration is slow on large sites:** every path is replayed from a fresh page load.
+- **Late-appearing elements** (timers, banners) are explored only on a later run.
+- **No approvals during recovery.** If getting past an obstacle needs your approval, the step fails instead of asking you.
+- **Memory is basic.** It keeps what you ask it to remember and summarises each chat session, but learns little on its own.
+- **Weaker without a model.** Requests are matched by keywords, so they must name what they want.
+- **Setup:**
+  - FalkorDB must be version 4.22.1.
+  - On Windows, if the visible browser does not start, set `SITEGRAPH_BROWSER_CHANNEL=chrome`.
+  - The web console is a separate project; this repository has no web server.

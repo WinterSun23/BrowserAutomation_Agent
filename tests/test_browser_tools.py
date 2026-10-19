@@ -211,7 +211,7 @@ def test_make_demo_wraps_the_director(box, monkeypatch):
 
     monkeypatch.setattr(demo_agent, "DemoDirector", StubDirector)
     r = box.call("make_demo", {"request": "gif of the menu"})
-    assert r.ok and r.data["storyboard"] == "sb:1" and r.data["renders"] == [{"format": "gif", "file": "abc.gif"}]
+    assert r.ok and r.data["storyboard"] == "sb:1" and r.data["renders"] == [{"format": "gif", "file": "abc.gif", "bytes": None}]
 
 
 def _other_site(shop):

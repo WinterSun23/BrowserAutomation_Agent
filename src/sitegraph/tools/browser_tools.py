@@ -173,7 +173,9 @@ def list_items(ctx: ToolContext, args: dict):
     el = _element(ctx, args["element_id"])
     if not el.is_template:
         raise ValueError("this element is not a repeated list item")
-    return {"items": live_item_texts(get_nav(ctx).session.page, el.props())}
+    return {"items": live_item_texts(get_nav(ctx).session.page, el.props()),
+            "next": "these are all the entries with their full text (prices, ratings...): compare them yourself, then "
+                    "click this element with item set to the chosen entry's text, copied exactly"}
 
 
 def _after(ctx: ToolContext, nav, before: str | None, el, kind: str, value=None, value_var: str | None = None,
@@ -211,6 +213,28 @@ def _acted(ctx: ToolContext, kind: str, el, value=None) -> None:
         ctx.extra.setdefault("acted", []).append(f"{kind}|{el.gid}" + (f"|{value}" if value is not None else ""))
 
 
+def _what(el, item: str | None) -> str:
+    """How an action is named in the rehearsal log and the script: the chosen list entry's title (without its price
+    and stock text) when there is one, else the element's name."""
+    text = item or el.name_sample or ""
+    return re.split(r"\s+[£$€₹¥]\s?\d", text)[0].strip()[:60]
+
+
+def rehearse(ctx: ToolContext, kind: str, label: str, el=None, **data) -> None:
+    """While the Demo agent rehearses, remember each action that worked, with what is needed to replay it in the final
+    take (`demo/script.py`). Actions above the policy are left out: an approval is never replayed."""
+    log = ctx.extra.get("rehearsal")
+    if log is None:
+        return
+    if el is not None and not policy_of(ctx).allows(el if isinstance(el, dict) else el.props()):
+        return
+    entry = {"id": f"a{len(log) + 1}", "kind": kind, "label": label[:120],
+             **{k: v for k, v in data.items() if v is not None}}
+    if el is not None:
+        entry["element"] = dict(el) if isinstance(el, dict) else el.props()
+    log.append(entry)
+
+
 def click(ctx: ToolContext, args: dict):
     nav, el = get_nav(ctx), _element(ctx, args["element_id"])
     _guard(ctx, el)
@@ -218,6 +242,7 @@ def click(ctx: ToolContext, args: dict):
     before = ctx.extra.get("state")
     nav._click(located)
     _acted(ctx, "click", el)
+    rehearse(ctx, "click", f"click '{_what(el, args.get('item'))}'", el, item=args.get("item"))
     return _after(ctx, nav, before, el, "click")
 
 
@@ -226,6 +251,7 @@ def hover(ctx: ToolContext, args: dict):
     _guard(ctx, el)
     nav._hover(_resolve(ctx, nav, el, args.get("item")))
     _acted(ctx, "hover", el)
+    rehearse(ctx, "hover", f"hover '{_what(el, args.get('item'))}'", el, item=args.get("item"))
     return {"hovered": el.name_sample[:60], "next": "call observe to see anything that appeared (menus, tooltips)"}
 
 
@@ -249,6 +275,8 @@ def fill(ctx: ToolContext, args: dict):
     name = args.get("var_name") or secret_var or var_name(el.name_norm, (el.fingerprint.get("attrs") or {}).get("name"))
     ctx.extra.setdefault("filled", {})[el.gid] = name          # only the variable NAME is remembered, never the value
     ctx.extra.setdefault("typed", []).append(value)            # in memory only: used to scrub it out of observations
+    if not secret_var:                                         # a stored secret is never replayed into a recording
+        rehearse(ctx, "fill", f"type into '{el.name_sample[:40]}'", el, value=value)
     return {"filled": el.name_sample[:60], "variable": name}
 
 
@@ -270,6 +298,7 @@ def select_option(ctx: ToolContext, args: dict):
     before = ctx.extra.get("state")
     nav._act("select", located, option)
     _acted(ctx, "select", el, option)
+    rehearse(ctx, "select", f"choose '{option[:40]}' in '{el.name_sample[:40]}'", el, value=option)
     var = var_name(el.name_norm, (el.fingerprint.get("attrs") or {}).get("name"))
     return {"selected": option, **_after(ctx, nav, before, el, "select", option, var)}
 
@@ -284,6 +313,7 @@ def set_checked(ctx: ToolContext, args: dict):
     before = ctx.extra.get("state")
     nav._act("check", located, str(checked))
     _acted(ctx, "check", el, str(checked))
+    rehearse(ctx, "check", f"{'check' if checked else 'uncheck'} '{el.name_sample[:40]}'", el, value=str(checked))
     return {"checked": checked, **_after(ctx, nav, before, el, "check", str(checked))}
 
 
@@ -313,6 +343,9 @@ def press(ctx: ToolContext, args: dict):
     located = _resolve(ctx, nav, el, None) if el is not None else None
     before = ctx.extra.get("state")
     nav._act("press", located, key)
+    if RISK_COST[risk] <= policy_of(ctx).max_risk_cost:
+        rehearse(ctx, "press", f"press {key}" + (f" in '{props['name_sample'][:40]}'" if el is not None else ""),
+                 props if el is not None else None, value=key)
     if el is None:            # a key on the page as a whole: nothing to record as an element's action
         ctx.extra.pop("elements", None)
         nav = get_nav(ctx)
@@ -362,6 +395,7 @@ def scroll(ctx: ToolContext, args: dict):
                    "up": "window.scrollBy(0, -window.innerHeight * 0.8)",
                    "top": "window.scrollTo(0, 0)",
                    "bottom": "window.scrollTo(0, document.documentElement.scrollHeight)"}[where])
+    rehearse(ctx, "scroll", f"scroll {where}", None, value=where)
     return {"scrolled": where, "scrollY": page.evaluate("window.scrollY")}
 
 
@@ -383,6 +417,8 @@ def open_url(ctx: ToolContext, args: dict):
     if policy_of(ctx).respect_robots and not robots_allowed(url):
         raise ValueError("robots.txt does not allow opening this URL")
     nav.session.goto(url)
+    if domain_of(url) == ctx.domain:                           # leaving the site needed an approval: never replayed
+        rehearse(ctx, "goto", f"open {url}", None, url=url)
     ctx.extra.pop("elements", None)
     nav = get_nav(ctx)                       # now on the new site, if it is another one
     ctx.extra["state"] = _write(ctx, nav, nav.observe())

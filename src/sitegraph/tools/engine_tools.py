@@ -38,6 +38,12 @@ def _run_goal(ctx: ToolContext, args: dict):
     policy = policy_of(ctx)
     res = nav.execute_goal(args["goal"], {}, policy, args.get("item"), request_text=args["goal"])
     ctx.extra["last_run"] = res.run_gid
+    if res.status == "done" and res.route is not None and res.route.steps:
+        from dataclasses import asdict
+
+        from .browser_tools import rehearse
+        rehearse(ctx, "goal", f"go to: {args['goal'][:80]}", None, goal=args["goal"], item=args.get("item"),
+                 steps=[asdict(st) for st in res.route.steps])
     ctx.extra.pop("elements", None)
     out = {"status": res.status, "explanation": res.explanation, "url": nav.session.url, "heals": res.heals,
            "replans": res.replans}
@@ -139,10 +145,17 @@ def _make_demo(ctx: ToolContext, args: dict):
         ctx.extra["demo_agent"] = agent
         res = agent.run(args["request"])
     if res.status == "needs_input":
-        return ToolResult(True, data={"question": res.answer}, pause=res.answer)
+        return ToolResult(True, data={"question": res.answer, **agent.export()}, pause=res.answer)
     ctx.extra.pop("demo_agent", None)
-    out = {"status": res.status, "storyboard": res.storyboard_gid,
-           "renders": [{"format": f, "file": ref} for f, ref in res.renders], "summary": res.answer}
+
+    def size(ref: str) -> int | None:
+        try:
+            return ctx.blobs.path(ref).stat().st_size if ctx.blobs is not None else None
+        except OSError:
+            return None
+
+    out = {"status": res.status, "storyboard": res.storyboard_gid, **agent.export(),
+           "renders": [{"format": f, "file": ref, "bytes": size(ref)} for f, ref in res.renders], "summary": res.answer}
     return out if res.status == "done" else ToolResult(False, data=out, error=res.answer)
 
 
