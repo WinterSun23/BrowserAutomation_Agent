@@ -1,3 +1,7 @@
+
+
+https://github.com/user-attachments/assets/edba8c8b-b907-4001-8a9e-7fe71a856284
+
 # SiteGraph
 
 SiteGraph is a Python agent system that explores a public website into a **FalkorDB graph**, then uses graph algorithms to plan routes, recommend automations, run them (and keep them working when the UI changes), and turn paths in the graph into demos (video, GIF, screenshot, step guide, click-through).
@@ -15,18 +19,15 @@ SiteGraph is a Python agent system that explores a public website into a **Falko
 
 **1. Architecture.** How the orchestrator, navigators, curator and the FalkorDB graphs fit together.
 
-<!-- VIDEO 1 (assets/Architecture.mp4): paste the video link here and delete this comment -->
-_Video 1 goes here._
+https://github.com/user-attachments/assets/71da28ba-f27b-4a37-ab31-4acbc16e348b
 
 **2. The web console.** The working front-end: live browser view, the agents, the graph and the trace, and approving a demo script.
 
-<!-- VIDEO 2 (assets/Agent-Demo.mp4): paste the video link here and delete this comment -->
-_Video 2 goes here._
+https://github.com/user-attachments/assets/505cbba7-baac-42ac-9e7b-04b896352060
 
 **3. A demo made by the agent.** The output of a request such as "make a video showing how to find the cheapest Mystery book": rehearsed, scripted and recorded as one take with a voice-over.
 
-<!-- VIDEO 3 (assets/Demo-Output.mp4): paste the video link here and delete this comment -->
-_Video 3 goes here._
+https://github.com/user-attachments/assets/109a9eb5-33f1-4b32-98d2-bf4cafc29f03
 
 ## Quick start
 
