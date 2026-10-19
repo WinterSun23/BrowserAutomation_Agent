@@ -13,21 +13,19 @@ SiteGraph is a Python agent system that explores a public website into a **Falko
 
 ## Demo videos
 
-Each video was made by the Demo agent itself: it rehearsed the task, wrote the script, and recorded one take with a spoken voice-over.
+**1. Architecture.** How the orchestrator, navigators, curator and the FalkorDB graphs fit together.
 
-**1. Finding the cheapest Mystery book (books.toscrape.com)**
-
-<!-- VIDEO 1: drag the .mp4 into this README on GitHub's editor, or paste its link here, and delete this comment -->
+<!-- VIDEO 1 (assets/Architecture.mp4): paste the video link here and delete this comment -->
 _Video 1 goes here._
 
-**2. Comparing a laptop's storage options (webscraper.io test shop)**
+**2. The web console.** The working front-end: live browser view, the agents, the graph and the trace, and approving a demo script.
 
-<!-- VIDEO 2: drag the .mp4 into this README on GitHub's editor, or paste its link here, and delete this comment -->
+<!-- VIDEO 2 (assets/Agent-Demo.mp4): paste the video link here and delete this comment -->
 _Video 2 goes here._
 
-**3. A driver offering a ride (GreenCommute India, signed in with a saved login)**
+**3. A demo made by the agent.** The output of a request such as "make a video showing how to find the cheapest Mystery book": rehearsed, scripted and recorded as one take with a voice-over.
 
-<!-- VIDEO 3: drag the .mp4 into this README on GitHub's editor, or paste its link here, and delete this comment -->
+<!-- VIDEO 3 (assets/Demo-Output.mp4): paste the video link here and delete this comment -->
 _Video 3 goes here._
 
 ## Quick start
