@@ -50,6 +50,7 @@ class ExecutionAgent:
         policy = policy or (profile.policy_for(site.domain, site.device) if profile else ExplorationPolicy())
         self.ctx = ToolContext(settings=settings, store=store, key=site.key, domain=site.domain, embedder=embedder,
                                llm=llm, policy=policy, profile=profile, device=site.device, blobs=blobs)
+        self.ctx.extra["entry_url"] = site.entry_url      # where an unexplored site starts (tools default to it)
         self.toolbox = build_toolbox(self.ctx)
         prefs = profile.get_prefs() if profile else {}
         memories = [m["text"] for m in profile.list_memories(8)] if profile else []
