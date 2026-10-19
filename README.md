@@ -11,9 +11,24 @@ SiteGraph is a Python agent system that explores a public website into a **Falko
 > - **Run live** on books.toscrape.com and the-internet.herokuapp.com: through the command line, through MCP with Claude as the agent, and with a small local model.
 > - **The web console lives in a separate repository** (`BrowserAgent-Frontend`, a WebSocket bridge that imports this package). This repository has no web server.
 
-## Demo video
+## Demo videos
 
-_To be recorded._
+Each video was made by the Demo agent itself: it rehearsed the task, wrote the script, and recorded one take with a spoken voice-over.
+
+**1. Finding the cheapest Mystery book (books.toscrape.com)**
+
+<!-- VIDEO 1: drag the .mp4 into this README on GitHub's editor, or paste its link here, and delete this comment -->
+_Video 1 goes here._
+
+**2. Comparing a laptop's storage options (webscraper.io test shop)**
+
+<!-- VIDEO 2: drag the .mp4 into this README on GitHub's editor, or paste its link here, and delete this comment -->
+_Video 2 goes here._
+
+**3. A driver offering a ride (GreenCommute India, signed in with a saved login)**
+
+<!-- VIDEO 3: drag the .mp4 into this README on GitHub's editor, or paste its link here, and delete this comment -->
+_Video 3 goes here._
 
 ## Quick start
 
@@ -309,14 +324,15 @@ Safety model (all inside the tools):
 - Every browser action is checked against the active exploration policy; above the allowed risk level it needs your one-time approval for that exact action (terminal prompt, or MCP elicitation). Approvals are never granted by a model.
 - Page and site text is passed to models marked as untrusted data, trimmed in length.
 - Typed values are never stored: `fill` remembers only a variable name, the value is scrubbed from URLs, titles and names before anything is written, and `Toolbox.redacted` hides it from logs and traces.
-- Sensitive fields are never filled from a request or by a model. That means passwords, email, phone, payment, address and personal-name fields, recognised by input type, autocomplete hint or name. A stored secret can be typed with `fill(from_secret=...)` without its value reaching the model.
+- Sensitive fields are never filled from a request or by a model. That means passwords, email, phone, payment, address and personal-name fields, recognised by input type, autocomplete hint or name. The only way to type into a password field is a stored secret (`fill(from_secret=...)`), which never reaches the model. To work behind a login, save a session once (`python -m sitegraph.browser.login <url> <file.json>`) and run with `SITEGRAPH_STORAGE_STATE=<file.json>`; keep that file private.
+- A submit that the page rejects (invalid fields, error text) is reported to the agent, and a demo take that hits one fails instead of claiming success.
 - Memory (`remember` / `recall` / `list_memories` / `forget`) refuses passwords, keys, emails and long numbers, and you can review and delete what is saved.
 - Limits per request (configurable): 60 model turns, ~400k tokens, 5 recovery attempts per run, 20 curator edits per review.
 - A model that cannot call tools, or no model at all, disables the agents and the fixed pipeline runs instead.
 
 ## Data use
 
-Only public, unauthenticated pages are explored. Typed input values are never stored in any graph, log or blob (only variable names). Exploration skips risky elements (checkout, delete, external links) and respects `robots.txt`. Good demo sites: `books.toscrape.com` and `quotes.toscrape.com` (built for scraping practice).
+Public pages are explored by default; a saved login (see the safety model above) lets it work behind a sign-in on a site you own or may use. Typed input values are never stored in any graph, log or blob (only variable names). Exploration skips risky elements (checkout, delete, external links) and respects `robots.txt`. Good demo sites: `books.toscrape.com` and `quotes.toscrape.com` (built for scraping practice).
 
 ## AI assistance disclosure
 

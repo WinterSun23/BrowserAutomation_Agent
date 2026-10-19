@@ -6,6 +6,7 @@ import re
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from ..browser.items import choose_item, live_item_texts
+from ..browser.problems import page_problems
 from ..db import device_key, ops_key
 from ..graph.queries import entry_state
 from ..graph.map_writer import MapWriter
@@ -194,8 +195,11 @@ def _after(ctx: ToolContext, nav, before: str | None, el, kind: str, value=None,
                                     value_var or ",".join(filled.values()) or None, (), list(filled))
         nav._set_edge_value("ACTION", g, value)
     ctx.extra.pop("elements", None)
-    return {**_page_summary(nav, after), "page_changed": after != before,
-            "next": "call observe to see the page and get fresh element ids"}
+    problems = page_problems(nav.session.page) if kind in ("click", "press") else []
+    note = {"page_problems": problems} if problems else {}
+    return {**_page_summary(nav, after), "page_changed": after != before, **note,
+            "next": ("the page reports a problem (page_problems): fix the fields and try again, do not call this a success"
+                     if problems else "call observe to see the page and get fresh element ids")}
 
 
 def _resolve(ctx: ToolContext, nav, el, item: str | None):
@@ -242,7 +246,16 @@ def click(ctx: ToolContext, args: dict):
     _guard(ctx, el)
     located = _resolve(ctx, nav, el, args.get("item"))
     before = ctx.extra.get("state")
-    nav._click(located)
+    try:
+        nav._click(located)
+    except Exception as exc:
+        if "not enabled" in str(exc):             # the page keeps the button off until the form is complete
+            hint = "; ".join(page_problems(nav.session.page)) or "nothing on the page says what is missing"
+            raise ValueError(
+                f"'{el.name_sample[:60]}' is disabled: the page does not consider the form complete yet ({hint}). A box "
+                "that suggests places or options (a dropdown under the text box) usually needs one suggestion clicked, "
+                "not only typed text: observe, pick the suggestion, then try again") from None
+        raise
     _acted(ctx, "click", el)
     rehearse(ctx, "click", f"click '{_what(el, args.get('item'))}'", el, item=args.get("item"))
     return _after(ctx, nav, before, el, "click")

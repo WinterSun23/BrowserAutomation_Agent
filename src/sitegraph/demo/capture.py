@@ -8,6 +8,7 @@ from pathlib import Path
 
 from ..agents.factory import make_navigator
 from ..agents.navigator import Navigator
+from ..browser.problems import page_problems
 from ..browser.session import BrowserSession
 from ..graph.queries import load_element
 from .storyboard import ShotPlan, Storyboard
@@ -23,6 +24,7 @@ class TakeFailed(Exception):
         self.scene, self.reason = scene, reason
 
 
+_FILL_ONLY_TYPES = {"date", "datetime-local", "time", "month", "week", "color", "range"}
 _ELEMENT_KINDS = {"click", "hover", "fill", "select", "check", "press"}
 _SCROLL_JS = {"down": "window.scrollBy(0, window.innerHeight * 0.8)", "up": "window.scrollBy(0, -window.innerHeight * 0.8)",
               "top": "window.scrollTo(0, 0)", "bottom": "window.scrollTo(0, document.documentElement.scrollHeight)"}
@@ -199,7 +201,10 @@ class DemoSession:
                 if kind == "fill":
                     located.locator.click(timeout=5000)
                     located.locator.fill("", timeout=5000)
-                    located.locator.press_sequentially(str(act.get("value", "")), delay=70)
+                    if located.locator.evaluate("e => e.type") in _FILL_ONLY_TYPES:   # date pickers need the whole value
+                        located.locator.fill(str(act.get("value", "")), timeout=5000)
+                    else:
+                        located.locator.press_sequentially(str(act.get("value", "")), delay=70)
                 elif kind in _ELEMENT_KINDS:
                     self.nav._act(kind, located, act.get("value"))
                 elif kind == "goto":
@@ -216,6 +221,11 @@ class DemoSession:
                 sess.settle()
                 self._overlay(scene.caption, None)
                 page.wait_for_timeout(1200)           # a moment on the result of the step
+                if kind in ("click", "press") and int((act.get("element") or {}).get("risk_cost") or 0) >= 1:
+                    problems = page_problems(page)    # a submit that the page rejected is not a finished demo
+                    if problems:
+                        raise TakeFailed(i, f"after '{act.get('label')}' the page reports a problem: "
+                                            + "; ".join(problems) + ". Fix the values in the rehearsal and write the script again")
             js("() => window.__sg && window.__sg.clear()")
             mark(i, t0)
         card(n + 1, script.title, script.outro or "Thanks for watching.")
