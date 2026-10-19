@@ -259,9 +259,9 @@ def fill(ctx: ToolContext, args: dict):
     nav, el = get_nav(ctx), _element(ctx, args["element_id"])
     if el.role not in ("textbox", "searchbox", "combobox"):
         raise ValueError(f"cannot type into a {el.role}")
-    if (el.input_kind or "").lower() == "password":
-        raise ValueError("refusing to type into a password field")
     secret_var = args.get("from_secret")
+    if (el.input_kind or "").lower() == "password" and not secret_var:
+        raise ValueError("refusing to type a password: use from_secret with a stored secret")
     if secret_var:
         # the vault value is typed without ever entering the model's context, the trace or the graph
         value = ctx.profile.secret_for(secret_var, ctx.domain) if ctx.profile is not None else None

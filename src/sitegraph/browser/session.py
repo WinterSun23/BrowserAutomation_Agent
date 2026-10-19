@@ -79,6 +79,9 @@ class BrowserSession:
         if self.record_video_dir:
             args["record_video_dir"] = str(self.record_video_dir)
             args["record_video_size"] = {"width": self.video_size[0], "height": self.video_size[1]}
+        state = os.environ.get("SITEGRAPH_STORAGE_STATE")     # a saved login (python -m sitegraph.browser.login)
+        if state:
+            args["storage_state"] = state
         self.context = self.browser.new_context(**args)
         self.page = self.context.new_page()
         self.started = time.monotonic()
