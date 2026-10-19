@@ -4,7 +4,7 @@ import pytest
 from sitegraph.agents.curator import Curator
 from sitegraph.agents.execution_agent import ExecutionAgent
 from sitegraph.agents.navigator import Navigator
-from sitegraph.agents.orchestrator import Orchestrator
+from sitegraph.agents.orchestrator import Orchestrator, RequestResult
 from sitegraph.blobs import BlobStore
 from sitegraph.browser.session import BrowserSession
 from sitegraph.db import device_key
@@ -21,8 +21,10 @@ pytestmark = [pytest.mark.integration, pytest.mark.browser]
 CART_OK = {"ok": True, "evidence": "Your cart", "reason": "the cart page"}
 
 
-def _llm(steps, verdict=None, answer="nothing"):
+def _llm(steps, verdict=None, answer="nothing", finish=None):
     def r(system, user):
+        if "decide whether" in system.lower():
+            return json.dumps(finish) if finish is not None else "not json"      # None: the word list decides
         if "Split the request" in user:
             return json.dumps({"steps": steps})
         if "Does this page" in user:
@@ -170,5 +172,98 @@ def test_a_finished_action_with_no_question_needs_no_tool_loop(shop):
     agent = ExecutionAgent(o.s, o.store, o.embedder, o.llm, None, site, o.profile, chat_llm=loop_llm, orchestrator=o)
     try:
         assert agent.ask("take me to my cart").status == "done" and not loop_llm.calls
+    finally:
+        agent.close()
+
+
+class _Counting:
+    """Wraps an LLM and counts calls the way TracingLLM.counters() reports them."""
+
+    def __init__(self, inner):
+        self.inner, self.calls = inner, 0
+
+    def complete(self, system, user, image_png=None):
+        self.calls += 1
+        return self.inner.complete(system, user, image_png)
+
+    def counters(self):
+        return {"calls": self.calls, "tokens": self.calls * 100}
+
+
+def test_the_plans_own_model_calls_are_counted_and_the_summary_says_where_it_ended(shop):
+    o, site = _orch(shop, _Counting(_llm(CART)))
+    agent = ExecutionAgent(o.s, o.store, o.embedder, o.llm, None, site, o.profile, chat_llm=ScriptedLLM([]),
+                           orchestrator=o)
+    try:
+        run = agent.ask("take me to my cart")
+        assert run.status == "done" and run.steps >= 2 and run.tokens == run.steps * 100   # planner + verify calls
+        assert "cart.html" in run.answer and "automate" not in run.answer.lower().split(":")[0]
+    finally:
+        agent.close()
+
+
+def test_the_answer_comes_from_ask_steps_only(shop):
+    o, site = _orch(shop, _llm(CART))
+    rr = o.handle("take me to my cart", site)
+    assert rr.status == "done" and rr.answer is None            # the route text of an automate step is not an answer
+
+
+def test_chat_does_not_force_goal_exploration(shop, monkeypatch):
+    o, site = _orch(shop, _llm([{"kind": "automate", "goal": "zzqx vvkk"}]))
+    o.s.goal_explore = True
+    calls = []
+    monkeypatch.setattr(Orchestrator, "explore_toward", lambda self, *a, **k: calls.append(a) or None)
+    try:
+        rr = o.handle("zzqx vvkk", site, goal_explore=False)
+        assert not calls and rr.steps[0]["status"] == "no_target" and "goal_explore" not in rr.steps[0]
+        o.handle("zzqx vvkk", site)                                # run and eval keep the automatic search
+        assert len(calls) == 1
+    finally:
+        o.s.goal_explore = False
+
+
+def test_finish_check_returns_the_answer_without_starting_the_loop(shop):
+    fin = {"complete": True, "answer": "Your cart is empty", "evidence": "Your cart", "reason": "cart page read"}
+    o, site = _orch(shop, _Counting(_llm(CART, finish=fin)))
+    loop_llm = ScriptedLLM([])
+    agent = ExecutionAgent(o.s, o.store, o.embedder, o.llm, None, site, o.profile, chat_llm=loop_llm, orchestrator=o)
+    try:
+        run = agent.ask("what is in my cart?")
+        assert run.status == "done" and run.answer == "Your cart is empty" and not loop_llm.calls
+        assert run.steps >= 3                                      # planner, verify and the finish check are counted
+    finally:
+        agent.close()
+
+
+def test_finish_check_hands_unfinished_requests_to_the_loop_with_its_reason(shop):
+    fin = {"complete": False, "answer": None, "evidence": "", "reason": "only the cart was opened, prices not read"}
+    o, site = _orch(shop, _llm(CART, finish=fin))
+    seen = []
+    loop_llm = ScriptedLLM([lambda m, t: seen.append(m[-1].content) or ChatMessage("assistant", content="done it")])
+    agent = ExecutionAgent(o.s, o.store, o.embedder, o.llm, None, site, o.profile, chat_llm=loop_llm, orchestrator=o)
+    try:
+        assert agent.ask("open the cart and tell me the total").answer == "done it"
+        assert "prices not read" in seen[0] and "finish the request" in seen[0].lower()
+    finally:
+        agent.close()
+
+
+def test_other_kinds_print_their_real_result(shop):
+    from sitegraph.agents.planner import Plan, PlanStep
+
+    o, site = _orch(shop, _llm(CART))
+    agent = ExecutionAgent(o.s, o.store, o.embedder, o.llm, None, site, o.profile, chat_llm=ScriptedLLM([]),
+                           orchestrator=o)
+    try:
+        def summary(text, kind, result):
+            rr = RequestResult(text, Plan([PlanStep(kind, "g")], "model"), [dict(result, kind=kind, step=0)], "done")
+            return agent._summary(rr)
+
+        assert "I like gifs" in summary("remember that I like gifs", "remember", {"memory": "mem:1"})
+        rec = summary("what should I automate?", "recommend", {
+            "next_actions": [{"label": "Open the cart"}], "suggested_workflows": [], "demo_candidates": [],
+            "frontier": [], "workflows": [{"name": "Checkout flow"}]})
+        assert "Open the cart" in rec and "Checkout flow" in rec
+        assert "workflow" in summary("save this as a workflow", "save_workflow", {"workflow": "wf:1"}).lower()
     finally:
         agent.close()

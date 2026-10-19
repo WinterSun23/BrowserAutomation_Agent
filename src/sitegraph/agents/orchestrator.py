@@ -714,10 +714,12 @@ class Orchestrator:
         return merged, agents
 
     def handle(self, text: str, site: SiteInfo, navigators: int | None = None, kind: str | None = None,
-               rescan: bool = False) -> RequestResult:
+               rescan: bool = False, goal_explore: bool = True) -> RequestResult:
         """The one request path for `run`, `chat` and the eval harness: plan -> run each step -> verify. Stops at
         the first step that does not succeed. A forced `kind` is a one-step plan. Steps that need the site share one
-        browser, so an `ask` after a navigation is answered on the page that navigation reached."""
+        browser, so an `ask` after a navigation is answered on the page that navigation reached.
+        `goal_explore=False` (chat) keeps a step that finds no matching screen from exploring on its own: the
+        failure goes to the chat model, which decides whether to call `explore_toward`."""
         self.last_page = None
         if kind:
             plan = Plan([PlanStep(kind, text, {}, None)], "override")
@@ -745,13 +747,13 @@ class Orchestrator:
                 here = (st.kind == "ask" and bool(steps) and steps[-1].get("kind") == "automate"
                         and step_status(steps[-1]) == "done")
                 intent = {"kind": st.kind, "goal": st.goal, "params": dict(st.params or {}), "item": st.item,
-                          "source": plan.source, "here": here}
+                          "source": plan.source, "here": here, "no_search": not goal_explore}
                 task = ops.create_task("chat", step_text, device=site.device)
                 r = self.run_task(task, step_text, site, navigators, rescan=rescan, intent=intent, session=sess)
                 r["step"] = i
                 steps.append(r)
-                if r.get("kind") in ("ask", "automate") and r.get("explanation"):
-                    answer = r["explanation"]
+                if r.get("kind") == "ask" and r.get("explanation") and step_status(r) == "done":
+                    answer = r["explanation"]          # the route text of an automate step is not an answer
                 if step_status(r) != "done":
                     return RequestResult(text, plan, steps, "partial" if i else "failed", answer, i)
         return RequestResult(text, plan, steps, "done", answer, None)
@@ -821,7 +823,8 @@ class Orchestrator:
             else:
                 here = bool(intent.get("here")) and session is not None
                 searched = (self.explore_toward(site, intent["goal"], text, policy, task_id, navigators)
-                            if self.s.goal_explore and kind in ("automate", "ask") and not here else None)
+                            if self.s.goal_explore and kind in ("automate", "ask") and not here
+                            and not intent.get("no_search") else None)
                 git = GitOps(self.store, self.s.uid, site.domain, self.s) if self.s.use_git else None
                 writer = git.main_recorder(site.device) if git else None
                 if git:
