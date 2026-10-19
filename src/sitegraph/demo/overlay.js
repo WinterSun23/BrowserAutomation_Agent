@@ -34,6 +34,12 @@ window.__sg = {
     d.style.transition = 'transform .4s ease'; d.style.transformOrigin = `${x}px ${y}px`; d.style.transform = `scale(${s})`;
   },
   unzoom() { const d = document.documentElement; d.style.transform = ''; d.style.transformOrigin = ''; },
+  // draw attention to the highlighted element without moving anything (page zoom pushes the caption off screen)
+  pulse() {
+    const e = document.getElementById('__sg_hl'); if (!e || !e.animate) return;
+    e.animate([{ boxShadow: '0 0 0 9999px rgba(0,0,0,.25), 0 0 0 0 rgba(255,61,113,.8)' },
+               { boxShadow: '0 0 0 9999px rgba(0,0,0,.25), 0 0 0 16px rgba(255,61,113,0)' }], { duration: 900, iterations: 2 });
+  },
   // a full-screen title / closing card (the recording shows it like a slide)
   card(title, text) {
     let k = document.getElementById('__sg_card');

@@ -25,7 +25,7 @@ class Scene:
     action: dict | None = None         # one rehearsal-log entry to replay; None = a still scene (explain what is shown)
     narration: str = ""                # spoken text (voiceover); empty: the caption is spoken
     hold: float = MIN_HOLD_S           # seconds the caption stays up before the action
-    zoom: bool = False                 # zoom into the element while explaining it
+    zoom: bool = False                 # emphasise the element (a pulsing highlight) while explaining it
 
 
 @dataclass
@@ -47,7 +47,7 @@ class DemoScript:
         for n, s in enumerate(self.scenes, 1):
             what = s.action["label"] if s.action else "show the page"
             lines.append(f"{n}. **{s.caption}**")
-            lines.append(f"   - Action: {what}" + (" (zoomed in)" if s.zoom else ""))
+            lines.append(f"   - Action: {what}" + (" (emphasised)" if s.zoom else ""))
             if s.narration:
                 lines.append(f"   - Narration: {s.narration}")
             lines.append(f"   - Hold: {s.hold:.1f} s")

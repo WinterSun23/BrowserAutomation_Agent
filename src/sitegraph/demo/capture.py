@@ -192,10 +192,9 @@ class DemoSession:
             result.keyframes[i] = sess.screenshot_png()
             if box:
                 result.hotspots[i] = [box["x"], box["y"], box["width"], box["height"]]
-                if scene.zoom:
-                    self._overlay(scene.caption, box, zoom=True)
-                    page.wait_for_timeout(900)
-                    js("() => window.__sg && window.__sg.unzoom()")
+                if scene.zoom:                    # emphasise: a pulsing highlight (page zoom hides the caption)
+                    js("() => window.__sg && window.__sg.pulse()")
+                    page.wait_for_timeout(1300)
             try:
                 if kind == "fill":
                     located.locator.click(timeout=5000)

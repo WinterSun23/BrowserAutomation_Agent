@@ -216,7 +216,7 @@ def _acted(ctx: ToolContext, kind: str, el, value=None) -> None:
 def _what(el, item: str | None) -> str:
     """How an action is named in the rehearsal log and the script: the chosen list entry's title (without its price
     and stock text) when there is one, else the element's name."""
-    text = item or el.name_sample or ""
+    text = item or el.name_sample or getattr(el, "role", "") or "control"      # an unnamed button is still a button
     return re.split(r"\s+[£$€₹¥]\s?\d", text)[0].strip()[:60]
 
 

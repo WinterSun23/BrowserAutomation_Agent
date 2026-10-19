@@ -88,7 +88,8 @@ def register(box: Toolbox) -> None:
         "action": {"type": "string", "description": "a rehearsal action id, or omit for a scene that explains the page"},
         "caption": {"type": "string", "description": "explains the step for a newcomer: why, and what to notice"},
         "narration": {"type": "string"}, "hold": {"type": "number", "description": "seconds on screen (2.5-8)"},
-        "zoom": {"type": "boolean"}}, "required": ["caption"]}
+        "zoom": {"type": "boolean", "description": "pulse the highlight on the element to draw the eye to it"}},
+        "required": ["caption"]}
     box.register(ToolSpec(
         "write_script", "Write the demo script from the rehearsal: title, intro, outro and scenes in order (only the "
         "actions that worked, no detours). The user may have to approve it before recording.",
