@@ -28,7 +28,9 @@ DEMO_SYSTEM = """You are the demo director of a website automation system. You m
    fine here; they never appear in the video. Every action that worked gets an id (rehearsal_log lists them).
    To compare values (prices, ratings, names) use list_items on the repeated list that observe marks with
    `repeated_items`: it returns every entry's full text, prices included, and click can open one entry by name
-   (item="..."). The entries already contain what you need: decide from them and click the chosen entry right away,
+   (item="..."). If observe shows no repeated list for what you must compare (the entries are just separate links
+   with shortened names), call read_text with max_chars 6000: names and prices come in the same order as the links
+   observe lists, so pick the right link by its position and click it by id. The entries already contain what you need: decide from them and click the chosen entry right away,
    without observing again or looking for a sort or filter control that observe did not list. Never call a tool again when it just gave you the same result: use what you learned, or change
    approach. Finish the rehearsal on the page that answers the request (for example the cheapest book's page).
 2. SCRIPT. When you know the way, call write_script: a title, an intro (what the viewer will learn), an outro, and
@@ -90,7 +92,8 @@ class DemoAgent:
         if not url:
             return DemoResult("", [], self.spec, "error", "The site has not been explored yet: explore it first.")
         self._start(url)
-        return self._drive(f"Make this demo for the user: {request}")
+        return self._drive(f"Make this demo for the user: {request}\nThe browser is already open on {url}. Stay on this "
+                           f"site ({self.domain}): never open another address or host.")
 
     def reply(self, text: str) -> DemoResult:
         """Continue after the agent asked the user a question (or showed the script for approval)."""
