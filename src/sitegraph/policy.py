@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import urllib.request
 from dataclasses import asdict, dataclass, field, replace
 from urllib.parse import urlsplit
 from urllib.robotparser import RobotFileParser
@@ -85,11 +86,21 @@ def robots_allowed(url: str, agent: str = "SiteGraphBot") -> bool:
         return True
     base = f"{parts.scheme}://{parts.netloc}"
     if base not in _ROBOTS:
-        rp = RobotFileParser(base + "/robots.txt")
-        try:
-            rp.read()
-        except Exception:
-            rp = None
-        _ROBOTS[base] = rp
+        _ROBOTS[base] = _load_robots(base, agent)
     rp = _ROBOTS[base]
     return True if rp is None else rp.can_fetch(agent, url)
+
+
+def _load_robots(base: str, agent: str) -> RobotFileParser | None:
+    """Fetch and parse a site's robots.txt under the bot's own name (some sites answer 403 to Python's default agent,
+    and the standard library then treats the whole site as forbidden). A file that cannot be had (4xx, a network
+    error) means no restrictions, as RFC 9309 says for an unavailable robots.txt."""
+    req = urllib.request.Request(base + "/robots.txt", headers={"User-Agent": agent})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            text = resp.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+    rp = RobotFileParser()
+    rp.parse(text.splitlines())
+    return rp
