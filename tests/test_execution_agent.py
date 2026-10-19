@@ -154,3 +154,22 @@ def test_pages_found_by_hand_are_curated_when_the_request_ends(shop):
         assert not agent.ctx.extra.get("dirty")                           # nothing left to curate
     finally:
         agent.close()
+
+
+def test_tools_start_from_the_url_the_chat_was_started_with_when_the_map_is_empty(store, msettings, site_url):
+    import uuid
+
+    domain = domain_of(site_url)
+    key = device_key(msettings.uid, domain, f"empty{uuid.uuid4().hex[:6]}")
+    ensure_device_schema(store, key, 384)
+    site = SiteInfo(domain, "desktop", key, ops_key(msettings.uid, domain), site_url + "/about.html")
+    agent = ExecutionAgent(msettings, store, HashEmbedder(), FakeLLM(site_responder), None, site,
+                           Profile(store, msettings.uid, HashEmbedder()), chat_llm=ScriptedLLM([]))
+    try:
+        seen = agent.toolbox.call("observe", {})
+        assert seen.ok and seen.data["url"].endswith("/about.html")          # not about:blank, not another page
+        res = agent.toolbox.call("explore_toward", {"goal": "open cart"})     # no entry_url argument needed
+        assert res.ok, res.error
+        assert store.ro_query(key, "MATCH (s:State) RETURN count(s)")[0][0] >= 1
+    finally:
+        agent.close()

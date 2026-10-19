@@ -86,7 +86,8 @@ def _run_route(ctx: ToolContext, args: dict):
 
 
 def _explore(ctx: ToolContext, args: dict):
-    entry = args.get("entry_url") or (entry_state(ctx.store, ctx.key) or [None, None])[1]
+    entry = (args.get("entry_url") or (entry_state(ctx.store, ctx.key) or [None, None])[1]
+             or ctx.extra.get("entry_url"))
     if not entry:
         raise ValueError("no entry_url given and the site has not been explored before")
     # resources come from config: the agent can ask for fewer browsers but never for more than allowed
@@ -106,7 +107,8 @@ def _explore(ctx: ToolContext, args: dict):
 
 def _explore_toward(ctx: ToolContext, args: dict):
     """Explore only as far as needed to find a screen for the goal (rounds of a few screens, most promising first)."""
-    entry = (entry_state(ctx.store, ctx.key) or [None, None])[1] or args.get("entry_url")
+    entry = ((entry_state(ctx.store, ctx.key) or [None, None])[1] or args.get("entry_url")
+             or ctx.extra.get("entry_url"))
     if not entry:
         raise ValueError("the site has not been explored and no entry_url was given")
     cap = max(1, min(MAX_NAVIGATORS, ctx.settings.navigators_per_site))
@@ -119,7 +121,8 @@ def _explore_toward(ctx: ToolContext, args: dict):
 def _run_on_devices(ctx: ToolContext, args: dict):
     """The same request on several devices at once (phone / tablet / desktop), tracked as one parent task."""
     devices = list(dict.fromkeys(args["devices"]))
-    entry = args.get("entry_url") or (entry_state(ctx.store, ctx.key) or [None, None])[1]
+    entry = (args.get("entry_url") or (entry_state(ctx.store, ctx.key) or [None, None])[1]
+             or ctx.extra.get("entry_url"))
     if not entry:
         raise ValueError("no entry_url given and the site has not been explored before")
     orch = Orchestrator(ctx.settings, ctx.store, ctx.embedder, ctx.llm, ctx.blobs, NullEvents())

@@ -124,6 +124,8 @@ def _ensure_page(ctx: ToolContext, nav) -> None:
         entry = entry_state(ctx.store, ctx.key)
         if entry:
             nav.session.goto(entry[1])
+        elif ctx.extra.get("entry_url"):                # an unexplored site: the URL the chat was started with
+            nav.session.goto(ctx.extra["entry_url"])
 
 
 def _element(ctx: ToolContext, element_id: str):
