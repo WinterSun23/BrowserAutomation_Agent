@@ -71,6 +71,9 @@ class Settings:
     agent_repeat_limit: int = 5        # the same tool call with the same result this many times stops the request (0: off)
     agent_keep_observations: int = 2   # page observations re-sent in full to the model (older ones become a stub; 0: all)
     chat_learn: bool = True            # curate the pages the chat agent visited by hand when a request ends
+    demo_max_seconds: int = 120        # target length of a demo video
+    demo_retakes: int = 2              # final takes the Demo agent may re-record after the first one
+    demo_approve_script: bool = True   # show the demo script to the user and wait for approval before recording
     escalate_navigator: bool = True    # a stuck Navigator step may hand over to an LLM recovery agent (needs a chat LLM)
     max_escalations_per_run: int = 5   # recovery attempts allowed per execution run
     escalation_max_steps: int = 30     # model turns one recovery attempt may use

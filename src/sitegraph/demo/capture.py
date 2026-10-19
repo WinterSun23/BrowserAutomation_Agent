@@ -15,6 +15,19 @@ from .storyboard import ShotPlan, Storyboard
 OVERLAY_JS = files("sitegraph.demo").joinpath("overlay.js").read_text(encoding="utf-8")
 
 
+class TakeFailed(Exception):
+    """A final take could not play a scene; the whole take is discarded."""
+
+    def __init__(self, scene: int, reason: str):
+        super().__init__(f"scene {scene}: {reason}")
+        self.scene, self.reason = scene, reason
+
+
+_ELEMENT_KINDS = {"click", "hover", "fill", "select", "check", "press"}
+_SCROLL_JS = {"down": "window.scrollBy(0, window.innerHeight * 0.8)", "up": "window.scrollBy(0, -window.innerHeight * 0.8)",
+              "top": "window.scrollTo(0, 0)", "bottom": "window.scrollTo(0, document.documentElement.scrollHeight)"}
+
+
 @dataclass
 class CaptureResult:
     video_path: Path | None
@@ -124,6 +137,115 @@ class DemoSession:
             page.evaluate("() => window.__sg && window.__sg.clear()")
         except Exception:
             pass
+
+    def play(self, script, policy) -> None:
+        """Record a whole script as ONE continuous take: a title card, then for every scene its step badge, explanatory
+        caption and highlighted element, a hold long enough to read, the action exactly as it worked in the rehearsal and a
+        moment on the result, then a closing card. Shot indices: 0 = title card, 1..n = scenes, n + 1 = closing card."""
+        from .script import reading_time
+
+        sess, page, result, n = self.sess, self.sess.page, self.result, len(script.scenes)
+
+        def mark(i: int, t0: float) -> None:
+            seg = (t0, time.monotonic() - sess.started)
+            result.shot_segments[i] = seg
+            if not result.segments:
+                result.segments.append(seg)
+            else:                                     # one continuous take: a single segment that keeps growing
+                result.segments[0] = (result.segments[0][0], seg[1])
+
+        def js(code: str, arg=None) -> None:
+            try:
+                page.evaluate(code, arg)
+            except Exception:
+                pass
+
+        def card(i: int, title: str, text: str) -> None:
+            t0 = time.monotonic() - sess.started
+            js("a => window.__sg && window.__sg.card(a[0], a[1])", [title, text])
+            page.wait_for_timeout(int(reading_time(f"{title} {text}") * 1000))
+            result.keyframes[i] = sess.screenshot_png()
+            js("() => window.__sg && window.__sg.uncard()")
+            mark(i, t0)
+
+        card(0, script.title, script.intro)
+        for i, scene in enumerate(script.scenes, 1):
+            t0 = time.monotonic() - sess.started
+            act = scene.action or {}
+            kind = act.get("kind")
+            located, box = None, None
+            if kind in _ELEMENT_KINDS and act.get("element"):
+                if not policy.allows(act["element"]):
+                    raise TakeFailed(i, f"'{act['label']}' is above the allowed risk level: demos replay safe actions only")
+                located = self.nav.resolver.resolve(act["element"], item_match=act.get("item"))
+                if located is None:
+                    raise TakeFailed(i, f"could not find the element for '{act['label']}' on the page")
+                try:                              # bring the element into view so the viewer can see what is meant
+                    located.locator.scroll_into_view_if_needed(timeout=3000)
+                    page.wait_for_timeout(500)
+                    box = located.locator.bounding_box()
+                except Exception:
+                    box = None
+            js("t => window.__sg && window.__sg.step(t)", f"Step {i} of {n}")
+            self._overlay(scene.caption, box)
+            page.wait_for_timeout(int(scene.hold * 1000))
+            result.keyframes[i] = sess.screenshot_png()
+            if box:
+                result.hotspots[i] = [box["x"], box["y"], box["width"], box["height"]]
+                if scene.zoom:
+                    self._overlay(scene.caption, box, zoom=True)
+                    page.wait_for_timeout(900)
+                    js("() => window.__sg && window.__sg.unzoom()")
+            try:
+                if kind == "fill":
+                    located.locator.click(timeout=5000)
+                    located.locator.fill("", timeout=5000)
+                    located.locator.press_sequentially(str(act.get("value", "")), delay=70)
+                elif kind in _ELEMENT_KINDS:
+                    self.nav._act(kind, located, act.get("value"))
+                elif kind == "goto":
+                    sess.goto(act["url"])
+                elif kind == "scroll":
+                    js(_SCROLL_JS.get(act.get("value"), _SCROLL_JS["down"]))
+                elif kind == "goal":
+                    self._play_route(act, i, scene.caption)
+            except TakeFailed:
+                raise
+            except Exception as exc:
+                raise TakeFailed(i, f"'{act.get('label')}' failed: {str(exc)[:200]}") from None
+            if kind:
+                sess.settle()
+                self._overlay(scene.caption, None)
+                page.wait_for_timeout(1200)           # a moment on the result of the step
+            js("() => window.__sg && window.__sg.clear()")
+            mark(i, t0)
+        card(n + 1, script.title, script.outro or "Thanks for watching.")
+
+
+    def _play_route(self, act: dict, scene: int, caption: str) -> None:
+        """A rehearsal `run_goal`: replay its route step by step through the Navigator (learned steps and healing apply),
+        highlighting each element as it is used."""
+        from ..graph.queries import RouteStep
+
+        self.nav._request_text = act.get("goal")
+        for k, raw in enumerate(act.get("steps") or []):
+            step = RouteStep(**raw)
+            el = load_element(self.store, self.key, step.el_gid)
+            loc = self.nav.resolver.resolve(el, item_match=act.get("item")) if el else None
+            box = None
+            if loc:
+                try:
+                    loc.locator.scroll_into_view_if_needed(timeout=3000)
+                    self.sess.page.wait_for_timeout(400)
+                    box = loc.locator.bounding_box()
+                except Exception:
+                    box = None
+            self._overlay(caption, box)
+            self.sess.page.wait_for_timeout(1100)
+            out = self.nav.execute_step(step, self.run, scene * 100 + k, {}, act.get("item"))
+            if not out.ok:
+                raise TakeFailed(scene, f"step '{step.label}' of '{act.get('label')}' did not reach the expected screen")
+            self.cur = out.landed
 
     def close(self) -> CaptureResult:
         """Stop recording (this finalises the video file) and return everything captured."""

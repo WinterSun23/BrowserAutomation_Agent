@@ -294,6 +294,17 @@ The deterministic engine stays the fast, cheap, no-LLM path. LLM agents sit on t
 | **Demo Director** | Records and renders demos | Full **Demo agent**: chooses shots, records them one by one, looks at previews and retakes bad ones, writes captions, renders video / GIF / screenshot / guide / click-through, and may ask you a question. The fixed pipeline remains the fallback with no LLM |
 | **Orchestrator** | Turns a request into tasks for the other components | With a model it:<br>- splits a request into steps;<br>- profiles a new site before exploring it (from robots.txt, the sitemap and the entry page);<br>- chooses between brute-force and guided exploration;<br>- searches toward a screen the map does not have yet;<br>- checks the result: a *verify* step must quote evidence that is really on the page. |
 
+### Demo videos
+
+With a model that can call tools, a demo request ("make a video showing how to find the cheapest Mystery book") runs in four phases:
+
+1. **Rehearse.** The Demo agent works the task out on the live site like a user would, by trial and error. Nothing is recorded, and every action that worked is logged.
+2. **Script.** From the actions that worked, it writes a script: a title, an intro, an outro and one scene per step. Each caption explains the step (why it is done, what to notice) rather than just naming the click. Dead ends are left out. The script is saved as `script.md`, and the user can approve it or ask for changes before anything is recorded (`demo_approve_script`).
+3. **Final take.** The script is replayed in a fresh browser as one continuous recording: a title card, then each scene with its step number, caption, highlighted element and reading pause, then a closing card. If a scene fails, the take is thrown away and recorded again (`demo_retakes`).
+4. **Render.** The take becomes a video, GIF, step guide, Markdown guide or click-through. A spoken voice-over is added with `pip install .[tts]`.
+
+Without a model, the fixed pipeline plans a demo from the graph's routes and records it with plain captions.
+
 Safety model (all inside the tools):
 - Every browser action is checked against the active exploration policy; above the allowed risk level it needs your one-time approval for that exact action (terminal prompt, or MCP elicitation). Approvals are never granted by a model.
 - Page and site text is passed to models marked as untrusted data, trimmed in length.

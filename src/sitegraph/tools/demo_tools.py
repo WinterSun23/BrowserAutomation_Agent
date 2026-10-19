@@ -61,8 +61,49 @@ def render(ctx: ToolContext, args: dict):
     return _demo(ctx).render(list(args["formats"]), bool(args.get("narration")))
 
 
+def rehearsal_log(ctx: ToolContext, args: dict):
+    return {"actions": _demo(ctx).rehearsal_log()}
+
+
+def write_script(ctx: ToolContext, args: dict):
+    return _demo(ctx).write_script(args["title"], args.get("intro", ""), args.get("outro", ""), list(args["scenes"]),
+                                   args.get("goal"))
+
+
+def record_final(ctx: ToolContext, args: dict):
+    return _demo(ctx).record_final()
+
+
+def review_take(ctx: ToolContext, args: dict):
+    png, label = _demo(ctx).review(int(args["scene"]))
+    return ToolResult(True, data={"scene": args["scene"], "note": "the image is attached to your next turn"},
+                      image_png=png, image_label=label)
+
+
 def register(box: Toolbox) -> None:
     sid = {"shot_id": {"type": "integer"}}
+    box.register(ToolSpec("rehearsal_log", "List the actions that worked during the rehearsal, with their ids "
+                          "(a1, a2, ...) for write_script.", {"type": "object", "properties": {}}, rehearsal_log, "read"))
+    scene = {"type": "object", "properties": {
+        "action": {"type": "string", "description": "a rehearsal action id, or omit for a scene that explains the page"},
+        "caption": {"type": "string", "description": "explains the step for a newcomer: why, and what to notice"},
+        "narration": {"type": "string"}, "hold": {"type": "number", "description": "seconds on screen (2.5-8)"},
+        "zoom": {"type": "boolean"}}, "required": ["caption"]}
+    box.register(ToolSpec(
+        "write_script", "Write the demo script from the rehearsal: title, intro, outro and scenes in order (only the "
+        "actions that worked, no detours). The user may have to approve it before recording.",
+        {"type": "object", "properties": {"title": {"type": "string"}, "goal": {"type": "string"},
+                                          "intro": {"type": "string"}, "outro": {"type": "string"},
+                                          "scenes": {"type": "array", "items": scene, "minItems": 1}},
+         "required": ["title", "scenes"]}, write_script, "act"))
+    box.register(ToolSpec(
+        "record_final", "Record the approved script as ONE continuous take in a fresh browser (title card, scenes, "
+        "closing card). A failure names the scene to fix.", {"type": "object", "properties": {}}, record_final, "act",
+        untrusted_output=True))
+    box.register(ToolSpec(
+        "review_take", "Look at one scene of the final take (0 = title card, last = closing card); the image is shown "
+        "to you on your next turn.", {"type": "object", "properties": {"scene": {"type": "integer"}},
+                                       "required": ["scene"]}, review_take, "read"))
     box.register(ToolSpec(
         "capture_route", "Record a route from plan_route as shots (one per step, each highlighting the element). "
         "visible=false only drives to the start of the demo without recording.",
