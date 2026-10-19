@@ -10,6 +10,7 @@ from ..llm import ChatMessage
 from ..policy import ExplorationPolicy
 from ..tools import ToolContext, build_toolbox
 from .curator import Curator
+from .finish import finish_check, wants_answer  # noqa: F401 - wants_answer is re-exported
 from .loop import AgentLoop, AgentRun
 from .orchestrator import SiteInfo
 
@@ -37,16 +38,6 @@ How to work:
   saved. Never store secrets or personal data.
 - Keep going until the request is done, then answer briefly: what you did and what the user should know.
 """
-
-
-_WANTS_ANSWER = re.compile(
-    r"\?\s*$|\b(what|which|who|how (much|many|long)|where|when|why|find|cheapest|lowest|highest|best|compare|list|"
-    r"tell me|show me|price|cost|rating|count)\b", re.I)
-
-
-def wants_answer(text: str) -> bool:
-    """The request asks for information, not only for an action (so a finished action is not the whole job)."""
-    return bool(_WANTS_ANSWER.search(text or ""))
 
 
 class ExecutionAgent:
@@ -101,19 +92,60 @@ class ExecutionAgent:
             except Exception as exc:                       # learning is a bonus: never fail the request over it
                 logging.getLogger(__name__).warning("could not curate %s: %s", key, exc)
 
-    @staticmethod
-    def _summary(rr) -> str:
-        if rr.answer:
+    def _calls(self) -> tuple[int, int]:
+        """(model calls, tokens) so far of the orchestrator's model (planner, verify, summaries), if it counts them."""
+        counters = getattr(self.orchestrator.llm, "counters", None) if self.orchestrator is not None else None
+        try:
+            c = counters() if counters else None
+        except Exception:
+            c = None
+        return (int(c["calls"]), int(c["tokens"])) if c else (0, 0)
+
+    def _summary(self, rr) -> str:
+        if rr.answer and not any(r.get("kind") == "automate" for r in rr.steps):
             return rr.answer
         lines = []
         for r in rr.steps:
             if r.get("kind") == "explore":
-                lines.append(f"Explored: {r.get('states', 0)} screens, {r.get('actions', 0)} actions.")
+                lines.append(f"Explored the site: {r.get('states', 0)} screens, {r.get('actions', 0)} actions."
+                             + (f" {r['note']}" if r.get("note") else ""))
             elif r.get("kind") == "demo":
                 lines.append("Made the demo: " + ", ".join(f"{f} {p}" for f, p in r.get("renders", [])))
+            elif r.get("kind") == "automate":
+                lines.append(str(r.get("explanation") or "Done.").strip())
+            elif r.get("kind") == "ask":
+                lines.append(str(r.get("explanation") or "").strip())
+            elif r.get("kind") == "remember":
+                lines.append("Remembered: " + re.sub(r"^\s*remember( that)?\s*", "", rr.text, flags=re.I).strip())
+            elif r.get("kind") == "save_workflow":
+                goal = rr.plan.steps[min(r.get("step", 0), len(rr.plan.steps) - 1)].goal
+                lines.append(f"Saved the last run as a workflow ({goal}).")
+            elif r.get("kind") == "recommend":
+                lines.append(self._recommendation(r))
             else:
                 lines.append(f"{r.get('kind')}: done.")
-        return " ".join(lines) or "Done."
+        page = (self.orchestrator.last_page or {}) if self.orchestrator is not None else {}
+        if page.get("url") and any(r.get("kind") in ("automate", "ask") for r in rr.steps):
+            lines.append(f"You are now on {page['url']}.")
+        return "\n".join(l for l in lines if l) or "Done."
+
+    @staticmethod
+    def _brief(item) -> str:
+        if isinstance(item, dict):
+            for key in ("label", "name", "summary", "text", "to"):
+                if item.get(key):
+                    return str(item[key])[:80]
+        return str(item)[:80]
+
+    def _recommendation(self, r: dict) -> str:
+        parts = []
+        for title, key in (("Next actions", "next_actions"), ("Workflows", "workflows"),
+                           ("Suggested workflows", "suggested_workflows"), ("Worth a demo", "demo_candidates"),
+                           ("Still unexplored", "frontier")):
+            items = [self._brief(i) for i in (r.get(key) or [])[:5]]
+            if items:
+                parts.append(f"{title}: " + "; ".join(items))
+        return "\n".join(parts) or "Nothing to recommend yet: explore the site first."
 
     @staticmethod
     def _failure_note(rr, page: dict | None) -> str:
@@ -132,26 +164,36 @@ class ExecutionAgent:
     def ask(self, text: str, on_event: Callable[[dict], None] | None = None) -> AgentRun:
         self.ctx.extra["request_text"] = text         # lets click choose a list entry the request names
         note = None
+        calls0 = self._calls()
         if self.orchestrator is not None:
-            rr = self.orchestrator.handle(text, self.site)
+            rr = self.orchestrator.handle(text, self.site, goal_explore=False)
             self.last_result = rr
-            if rr.status == "done" and rr.answer is None and wants_answer(text):
-                # the plan did what it could but never produced an answer: the model finishes the request
+            fin = None
+            if rr.status == "done":
+                fin = finish_check(text, rr, self.orchestrator.last_page, self.orchestrator.llm)
+            calls1 = self._calls()
+            plan_calls, plan_tokens = calls1[0] - calls0[0], calls1[1] - calls0[1]
+            if fin is not None and not fin.complete:
+                # the plan did what it could but the request is not finished: the model continues from there
                 note = ("The saved map was used first and these steps are done: " + self._summary(rr) +
-                        " The user also wants an answer, so finish the request: use explore_toward, then find_screens "
-                        "/ run_goal, or observe, click and read_text by hand, and answer from what you read.")
-            elif rr.status == "done":
-                answer = self._summary(rr)
+                        f" Not finished yet: {fin.reason}. Finish the request: use explore_toward, then "
+                        "find_screens / run_goal, or observe, click and read_text by hand, and answer from what "
+                        "you read.")
+            elif fin is not None:
+                answer = fin.answer or self._summary(rr)
                 self.history += [ChatMessage("user", content=text), ChatMessage("assistant", content=answer)]
                 (on_event or (lambda e: None))({"type": "assistant", "content": answer})
                 if self.profile and self.session_id:
                     self.profile.log_request(self.session_id, text, "done", self.site.key, kind="chat")
-                return AgentRun("done", answer=answer, messages=self.history)
+                return AgentRun("done", answer=answer, steps=plan_calls, tokens=plan_tokens, messages=self.history)
             if rr.status not in ("chat", "done"):
                 note = self._failure_note(rr, self.orchestrator.last_page)
         hint = note or self.map_hint(text)
         label = "Automatic plan run" if note else "Automatic map lookup"
         run = self.loop.run(f"{text}\n\n[{label}, not written by the user] {hint}", self.history, on_event)
+        if self.orchestrator is not None:
+            run.steps += plan_calls                       # the plan's own model calls count too
+            run.tokens += plan_tokens
         if run.status != "needs_approval":
             self._learn()
         if self.profile and self.session_id:
